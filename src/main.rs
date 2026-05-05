@@ -63,6 +63,11 @@ const ICON_PREV:  &str = "\u{E892}";
 const ICON_PLAY:  &str = "\u{E768}";
 const ICON_PAUSE: &str = "\u{E769}";
 const ICON_NEXT:  &str = "\u{E893}";
+const ICON_GEAR:  &str = "\u{E713}"; // Settings gear (Segoe MDL2 Assets)
+
+// ── gear button ───────────────────────────────────────────────────────────────
+const GEAR_W:   i32 = 32; // gear button width
+const GEAR_PAD: i32 = 8;  // gap between gear button and right window edge
 
 // ── messages ──────────────────────────────────────────────────────────────────
 const WM_APPBAR:       u32 = WM_APP + 1;
@@ -72,7 +77,7 @@ const REFRESH_MS:      u64 = 1000;
 
 // ── settings window control IDs ───────────────────────────────────────────────
 const IDC_BARH_EDIT:     i32 = 101;
-const IDC_FONT_EDIT:     i32 = 102;
+const IDC_FONT_COMBO:    i32 = 102;
 const IDC_FONTSIZE_EDIT: i32 = 103;
 
 // ── registry keys ─────────────────────────────────────────────────────────────
@@ -82,7 +87,7 @@ const SETTINGS_KEY: PCWSTR = w!("Software\\MediaBar");
 
 // ── types ─────────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Default)]
-enum Hover { #[default] None, Prev, Play, Next }
+enum Hover { #[default] None, Prev, Play, Next, Gear }
 
 #[derive(Clone, Default)]
 struct MediaInfo {
@@ -449,13 +454,14 @@ fn fmt_time(t_100ns: i64) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-fn hit_btn(x: i32, group_x: i32) -> Hover {
+fn hit_btn(x: i32, group_x: i32, gear_x: i32) -> Hover {
     let prev_x = group_x;
     let play_x = group_x + BTN_W;
     let next_x = group_x + BTN_W * 2;
     if      (prev_x..prev_x + BTN_W).contains(&x) { Hover::Prev }
     else if (play_x..play_x + BTN_W).contains(&x) { Hover::Play }
     else if (next_x..next_x + BTN_W).contains(&x) { Hover::Next }
+    else if (gear_x..gear_x + GEAR_W).contains(&x) { Hover::Gear }
     else                                            { Hover::None }
 }
 
@@ -543,13 +549,13 @@ unsafe fn draw_btn_group(
     FillRect(dc, &RECT { left: gx, top: gy, right: gx2, bottom: gy2 }, bg_br);
     let _ = DeleteObject(bg_br);
 
-    if hover != Hover::None {
-        let hx = match hover {
-            Hover::Prev => gx,
-            Hover::Play => gx + BTN_W,
-            Hover::Next => gx + BTN_W * 2,
-            Hover::None => unreachable!(),
-        };
+    let hx_opt = match hover {
+        Hover::Prev => Some(gx),
+        Hover::Play => Some(gx + BTN_W),
+        Hover::Next => Some(gx + BTN_W * 2),
+        _           => None,
+    };
+    if let Some(hx) = hx_opt {
         let hov_br = CreateSolidBrush(COLORREF(C_BTN_HOV));
         FillRect(dc, &RECT { left: hx, top: gy, right: hx + BTN_W, bottom: gy2 }, hov_br);
         let _ = DeleteObject(hov_br);
@@ -558,7 +564,7 @@ unsafe fn draw_btn_group(
     let _ = RestoreDC(dc, saved);
     let _ = DeleteObject(rgn);
 
-    let bdr = if hover != Hover::None { C_BTN_BDR_H } else { C_BTN_BDR };
+    let bdr = if hx_opt.is_some() { C_BTN_BDR_H } else { C_BTN_BDR };
     let pn = CreatePen(PS_SOLID, 1, COLORREF(bdr));
     let op = SelectObject(dc, pn);
     let ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -590,6 +596,39 @@ unsafe fn draw_btn_group(
         let mut r = RECT { left: ix, top: gy, right: ix + BTN_W, bottom: gy2 };
         DrawTextW(dc, &mut wide, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
+    SelectObject(dc, of);
+}
+
+unsafe fn draw_gear_btn(dc: HDC, gx: i32, gy: i32, hovered: bool, font: HFONT) {
+    let gx2 = gx + GEAR_W;
+    let gy2 = gy + BTN_H;
+
+    // Background — clipped to rounded rect
+    let saved = SaveDC(dc);
+    let rgn   = CreateRoundRectRgn(gx, gy, gx2 + 1, gy2 + 1, CORNER, CORNER);
+    SelectClipRgn(dc, rgn);
+    let bg_br = CreateSolidBrush(COLORREF(if hovered { C_BTN_HOV } else { C_BTN }));
+    FillRect(dc, &RECT { left: gx, top: gy, right: gx2, bottom: gy2 }, bg_br);
+    let _ = DeleteObject(bg_br);
+    let _ = RestoreDC(dc, saved);
+    let _ = DeleteObject(rgn);
+
+    // Border
+    let pn = CreatePen(PS_SOLID, 1, COLORREF(if hovered { C_BTN_BDR_H } else { C_BTN_BDR }));
+    let op = SelectObject(dc, pn);
+    let ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    let _ = RoundRect(dc, gx, gy, gx2, gy2, CORNER, CORNER);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    let _ = DeleteObject(pn);
+
+    // Gear icon
+    let of = SelectObject(dc, font);
+    SetTextColor(dc, COLORREF(C_ICON));
+    SetBkMode(dc, TRANSPARENT);
+    let mut wide = w16(ICON_GEAR);
+    let mut r = RECT { left: gx, top: gy, right: gx2, bottom: gy2 };
+    DrawTextW(dc, &mut wide, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, of);
 }
 
@@ -702,17 +741,19 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
     let font_btn = HFONT(state.font_btn.load(Ordering::Relaxed) as *mut _);
     draw_btn_group(mdc, btn_top, group_x, hover, info.playing, font_btn);
 
+    // Gear button sits at the far right; everything else is pushed left of it.
+    let gear_x   = w - GEAR_PAD - GEAR_W;
     let has_seek = info.duration_100ns > 0;
     let text_max_x = if has_seek {
-        w - SEEK_PAD_R - SEEK_W - TIME_GAP - TIME_W - TIME_GAP
+        gear_x - SEEK_PAD_R - SEEK_W - TIME_GAP - TIME_W - TIME_GAP
     } else {
-        w
+        gear_x
     };
     let font = HFONT(state.font.load(Ordering::Relaxed) as *mut _);
     draw_media_text(mdc, &info, font, text_x, text_max_x, h);
 
     if has_seek {
-        let sx      = w - SEEK_PAD_R - SEEK_W;
+        let sx      = gear_x - SEEK_PAD_R - SEEK_W;
         let seek_cy = ACCENT_H + (h - ACCENT_H) / 2;
         let sy      = seek_cy - SEEK_H / 2;
 
@@ -779,6 +820,10 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
         let _ = DeleteDC(tmp_dc);
     }
 
+    // Gear button — always visible, vertically centred with the control buttons
+    let gear_top = ACCENT_H + (h - ACCENT_H - BTN_H) / 2;
+    draw_gear_btn(mdc, gear_x, gear_top, hover == Hover::Gear, font_btn);
+
     // Accent border — drawn last so it always renders on top
     let acc_rc = RECT { left: 0, top: 0, right: w, bottom: ACCENT_H };
     let acc = CreateSolidBrush(COLORREF(state.accent.load(Ordering::Relaxed)));
@@ -841,8 +886,8 @@ unsafe fn open_settings(hwnd_main: HWND, state_ptr: *mut AppState) {
     }));
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
-    let ww = 340;
-    let wh = 196;
+    let ww = 376;
+    let wh = 204;
     match CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW,
         w!("MediaBarSettings"),
@@ -857,6 +902,25 @@ unsafe fn open_settings(hwnd_main: HWND, state_ptr: *mut AppState) {
         }
         Err(_) => { let _ = Box::from_raw(ctx); }
     }
+}
+
+// Callback for EnumFontFamiliesExW — appends each unique face name to a Vec<String>.
+unsafe extern "system" fn enum_font_proc(
+    lpelfe: *const LOGFONTW,
+    _lpntme: *const TEXTMETRICW,
+    _font_type: u32,
+    lparam: LPARAM,
+) -> i32 {
+    if lpelfe.is_null() { return 1; }
+    let lf = &*lpelfe;
+    // Skip @-prefixed vertical-layout variants
+    if lf.lfFaceName[0] == b'@' as u16 { return 1; }
+    let end = lf.lfFaceName.iter().position(|&c| c == 0).unwrap_or(32);
+    if end == 0 { return 1; }
+    let name = String::from_utf16_lossy(&lf.lfFaceName[..end]);
+    let list = &mut *(lparam.0 as *mut Vec<String>);
+    list.push(name);
+    1 // continue enumeration
 }
 
 unsafe extern "system" fn settings_wndproc(
@@ -877,11 +941,12 @@ unsafe extern "system" fn settings_wndproc(
 
             let gui_font = GetStockObject(DEFAULT_GUI_FONT);
 
-            // Helper closure — creates a child control and sets its font
-            let mk = |class: PCWSTR, text: PCWSTR, style: u32,
+            // Helper — creates a child control, sets the system GUI font on it.
+            // ex: WS_EX_CLIENTEDGE (0x200) for edits; 0 for everything else.
+            let mk = |ex: u32, class: PCWSTR, text: PCWSTR, style: u32,
                       x: i32, y: i32, cw: i32, ch: i32, id: i32| -> HWND {
                 let hw = CreateWindowExW(
-                    WINDOW_EX_STYLE(0), class, text,
+                    WINDOW_EX_STYLE(ex), class, text,
                     WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | style),
                     x, y, cw, ch,
                     hwnd, HMENU(id as usize as *mut _), hi, None,
@@ -890,32 +955,65 @@ unsafe extern "system" fn settings_wndproc(
                 hw
             };
 
-            // Labels
-            mk(w!("STATIC"), w!("バーの高さ"),    0, 16, 20, 110, 20, 0);
-            mk(w!("STATIC"), w!("px"),              0, 208, 20, 30,  20, 0);
-            mk(w!("STATIC"), w!("フォント名"),      0, 16, 54, 110, 20, 0);
-            mk(w!("STATIC"), w!("フォントサイズ"), 0, 16, 88, 110, 20, 0);
-            mk(w!("STATIC"), w!("px"),              0, 208, 88, 30,  20, 0);
+            // ── layout ────────────────────────────────────────────────────────
+            // Client area: ~356 × 162 px
+            // Columns:  label x=20 w=112 | control x=140 w=196
+            // Rows:     y=20 (barh), y=55 (font), y=91 (size)
+            // Buttons:  y=129, right-aligned to x=336
+            let (lx, cx, cw, rh) = (20i32, 140i32, 196i32, 22i32);
 
-            // Edits
-            let barh_edit = mk(w!("EDIT"), w!(""),
-                WS_BORDER.0 | WS_TABSTOP.0, 140, 17, 60, 22, IDC_BARH_EDIT);
-            let font_edit = mk(w!("EDIT"), w!(""),
-                WS_BORDER.0 | WS_TABSTOP.0, 140, 51, 160, 22, IDC_FONT_EDIT);
-            let size_edit = mk(w!("EDIT"), w!(""),
-                WS_BORDER.0 | WS_TABSTOP.0, 140, 85, 60,  22, IDC_FONTSIZE_EDIT);
+            mk(0, w!("STATIC"), w!("バーの高さ"),    0, lx, 22, 112, rh, 0);
+            mk(0, w!("STATIC"), w!("px"),              0, cx+68, 22, 28, rh, 0);
+            mk(0, w!("STATIC"), w!("フォント"),       0, lx, 58, 112, rh, 0);
+            mk(0, w!("STATIC"), w!("フォントサイズ"), 0, lx, 94, 112, rh, 0);
+            mk(0, w!("STATIC"), w!("px"),              0, cx+68, 94, 28, rh, 0);
 
-            // Buttons (IDOK=1, IDCANCEL=2 — recognised by IsDialogMessageW)
-            mk(w!("BUTTON"), w!("OK"),         WS_TABSTOP.0 | 1, 170, 128, 70, 28, 1);
-            mk(w!("BUTTON"), w!("キャンセル"), WS_TABSTOP.0,     248, 128, 72, 28, 2);
+            // Edits — WS_EX_CLIENTEDGE gives the modern sunken look
+            let barh_edit = mk(0x200, w!("EDIT"), w!(""),
+                WS_TABSTOP.0, cx, 20, 60, rh, IDC_BARH_EDIT);
+            let size_edit = mk(0x200, w!("EDIT"), w!(""),
+                WS_TABSTOP.0, cx, 92, 60, rh, IDC_FONTSIZE_EDIT);
 
-            // Populate edits with current values
+            // Font combobox — CBS_DROPDOWNLIST=0x3, WS_TABSTOP, height=200 for dropdown
+            let font_combo = mk(0, w!("COMBOBOX"), w!(""),
+                0x0003 | WS_TABSTOP.0, cx, 55, cw, 200, IDC_FONT_COMBO);
+
+            // Buttons — right-aligned, OK on the far right
+            let (bw, by, bh) = (72i32, 129i32, 26i32);
+            let br = cx + cw; // right edge = 336
+            mk(0, w!("BUTTON"), w!("OK"),         WS_TABSTOP.0 | 1, br - bw,      by, bw, bh, 1);
+            mk(0, w!("BUTTON"), w!("キャンセル"), WS_TABSTOP.0,     br - bw*2 - 8, by, bw, bh, 2);
+
+            // ── populate values ───────────────────────────────────────────────
             let t: Vec<u16> = bar_h.to_string().encode_utf16().chain([0u16]).collect();
             let _ = SetWindowTextW(barh_edit, PCWSTR(t.as_ptr()));
-            let t: Vec<u16> = font_face.encode_utf16().chain([0u16]).collect();
-            let _ = SetWindowTextW(font_edit, PCWSTR(t.as_ptr()));
             let t: Vec<u16> = font_size.to_string().encode_utf16().chain([0u16]).collect();
             let _ = SetWindowTextW(size_edit, PCWSTR(t.as_ptr()));
+
+            // Enumerate all installed font families → fill combobox
+            let hdc = GetDC(hwnd);
+            let mut font_list: Vec<String> = Vec::new();
+            let logfont = LOGFONTW { lfCharSet: DEFAULT_CHARSET, ..Default::default() };
+            EnumFontFamiliesExW(
+                hdc, &logfont, Some(enum_font_proc),
+                LPARAM(&mut font_list as *mut Vec<String> as isize), 0,
+            );
+            ReleaseDC(hwnd, hdc);
+            font_list.sort_unstable();
+            font_list.dedup();
+            for name in &font_list {
+                let wide: Vec<u16> = name.encode_utf16().chain([0u16]).collect();
+                SendMessageW(font_combo, 0x0143 /*CB_ADDSTRING*/, WPARAM(0),
+                    LPARAM(wide.as_ptr() as isize));
+            }
+            // Select the currently configured font face (exact match)
+            let cur: Vec<u16> = font_face.encode_utf16().chain([0u16]).collect();
+            let idx = SendMessageW(font_combo, 0x0158 /*CB_FINDSTRINGEXACT*/,
+                WPARAM(usize::MAX), LPARAM(cur.as_ptr() as isize));
+            if idx.0 >= 0 {
+                SendMessageW(font_combo, 0x014E /*CB_SETCURSEL*/,
+                    WPARAM(idx.0 as usize), LPARAM(0));
+            }
 
             LRESULT(0)
         }
@@ -928,23 +1026,35 @@ unsafe extern "system" fn settings_wndproc(
                 1 => { // IDOK — read, validate, apply
                     let mut buf = [0u16; 256];
 
-                    let barh_edit = GetDlgItem(hwnd, IDC_BARH_EDIT)
+                    let barh_edit  = GetDlgItem(hwnd, IDC_BARH_EDIT)
                         .unwrap_or(HWND(std::ptr::null_mut()));
-                    let font_edit = GetDlgItem(hwnd, IDC_FONT_EDIT)
+                    let font_combo = GetDlgItem(hwnd, IDC_FONT_COMBO)
                         .unwrap_or(HWND(std::ptr::null_mut()));
-                    let size_edit = GetDlgItem(hwnd, IDC_FONTSIZE_EDIT)
+                    let size_edit  = GetDlgItem(hwnd, IDC_FONTSIZE_EDIT)
                         .unwrap_or(HWND(std::ptr::null_mut()));
 
                     let bar_h = {
                         let n = GetWindowTextW(barh_edit, &mut buf) as usize;
                         String::from_utf16_lossy(&buf[..n])
                             .trim().parse::<i32>()
-                            .unwrap_or(DEFAULT_BAR_H).clamp(20, 100)
+                            .unwrap_or(DEFAULT_BAR_H).clamp(40, 100)
                     };
+                    // Read selected font from the combobox
                     let font_face = {
-                        let n = GetWindowTextW(font_edit, &mut buf) as usize;
-                        let s = String::from_utf16_lossy(&buf[..n]).trim().to_string();
-                        if s.is_empty() { DEFAULT_FONT_FACE.to_string() } else { s }
+                        let idx = SendMessageW(font_combo,
+                            0x0147 /*CB_GETCURSEL*/, WPARAM(0), LPARAM(0));
+                        if idx.0 >= 0 {
+                            let len = SendMessageW(font_combo,
+                                0x0149 /*CB_GETLBTEXTLEN*/,
+                                WPARAM(idx.0 as usize), LPARAM(0));
+                            if len.0 > 0 {
+                                let mut fbuf = vec![0u16; len.0 as usize + 1];
+                                SendMessageW(font_combo, 0x0148 /*CB_GETLBTEXT*/,
+                                    WPARAM(idx.0 as usize),
+                                    LPARAM(fbuf.as_mut_ptr() as isize));
+                                String::from_utf16_lossy(&fbuf[..len.0 as usize])
+                            } else { DEFAULT_FONT_FACE.to_string() }
+                        } else { DEFAULT_FONT_FACE.to_string() }
                     };
                     let font_size = {
                         let n = GetWindowTextW(size_edit, &mut buf) as usize;
@@ -1006,13 +1116,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let x = (lp.0 & 0xFFFF) as i16 as i32;
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
-                // rc.bottom = bar height; derive group_x from it
                 let group_x = rc.bottom + SIDE_PAD;
+                let gear_x  = rc.right - GEAR_PAD - GEAR_W;
 
                 let dragging = {
                     let mut drag = (*sp).seeking.lock().unwrap();
                     if drag.is_some() {
-                        let sx = rc.right - SEEK_PAD_R - SEEK_W;
+                        let sx = gear_x - SEEK_PAD_R - SEEK_W;
                         *drag = Some(((x - sx) as f64 / SEEK_W as f64).clamp(0.0, 1.0));
                         true
                     } else {
@@ -1022,7 +1132,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if dragging {
                     let _ = InvalidateRect(hwnd, None, false);
                 } else {
-                    let new_hover = hit_btn(x, group_x);
+                    let new_hover = hit_btn(x, group_x, gear_x);
                     let mut hov = (*sp).hover.lock().unwrap();
                     if *hov != new_hover {
                         *hov = new_hover;
@@ -1066,7 +1176,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let hw = hwnd.0 as isize;
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
-            let sx      = rc.right - SEEK_PAD_R - SEEK_W;
+            let gear_x  = rc.right - GEAR_PAD - GEAR_W;
+            let sx      = gear_x - SEEK_PAD_R - SEEK_W;
             let group_x = rc.bottom + SIDE_PAD;
 
             if x >= sx && x < sx + SEEK_W && !sp.is_null() {
@@ -1078,10 +1189,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             } else {
-                match hit_btn(x, group_x) {
+                match hit_btn(x, group_x, gear_x) {
                     Hover::Prev => send_cmd("prev", hw),
                     Hover::Play => send_cmd("play", hw),
                     Hover::Next => send_cmd("next", hw),
+                    Hover::Gear => { if !sp.is_null() { open_settings(hwnd, sp); } }
                     Hover::None => {}
                 }
             }
@@ -1235,10 +1347,24 @@ fn main() -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            // Route Tab/Enter/Escape to the settings window if it's open
             let sh_raw = SETTINGS_HWND.load(Ordering::Relaxed);
             if sh_raw != 0 {
                 let sh_hwnd = HWND(sh_raw as *mut _);
+                // Forward WM_MOUSEWHEEL to whatever window is under the cursor so the
+                // font combobox dropdown scrolls even when it doesn't have focus.
+                if msg.message == 0x020A /*WM_MOUSEWHEEL*/ {
+                    let lp32 = msg.lParam.0 as i32;
+                    let pt   = POINT {
+                        x: (lp32 & 0xFFFF) as i16 as i32,
+                        y: (lp32 >> 16)    as i16 as i32,
+                    };
+                    let target = WindowFromPoint(pt);
+                    if !target.0.is_null() {
+                        SendMessageW(target, msg.message, msg.wParam, msg.lParam);
+                        continue;
+                    }
+                }
+                // Route Tab / Enter / Escape to the settings window.
                 if IsDialogMessageW(sh_hwnd, &msg).as_bool() { continue; }
             }
             let _ = TranslateMessage(&msg);
