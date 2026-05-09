@@ -575,9 +575,20 @@ unsafe fn decode_thumbnail(bytes: &[u8], size: i32) -> Option<isize> {
         .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnLoad)
         .ok()?;
     let frame = decoder.GetFrame(0).ok()?;
+
+    // Fit within size×size while preserving aspect ratio
+    let mut orig_w = 0u32;
+    let mut orig_h = 0u32;
+    frame.GetSize(&mut orig_w, &mut orig_h).ok()?;
+    let scale = (size as f64 / orig_w as f64).min(size as f64 / orig_h as f64);
+    let dst_w = ((orig_w as f64 * scale) as i32).max(1);
+    let dst_h = ((orig_h as f64 * scale) as i32).max(1);
+    let x_off = (size - dst_w) / 2;
+    let y_off = (size - dst_h) / 2;
+
     let scaler = factory.CreateBitmapScaler().ok()?;
     scaler
-        .Initialize(&frame, size as u32, size as u32, WICBitmapInterpolationModeFant)
+        .Initialize(&frame, dst_w as u32, dst_h as u32, WICBitmapInterpolationModeFant)
         .ok()?;
     let converter = factory.CreateFormatConverter().ok()?;
     converter
@@ -591,6 +602,7 @@ unsafe fn decode_thumbnail(bytes: &[u8], size: i32) -> Option<isize> {
         )
         .ok()?;
 
+    // Allocate size×size DIB — zero-initialised (= black)
     let stride = (size * 4) as u32;
     let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
@@ -609,11 +621,22 @@ unsafe fn decode_thumbnail(bytes: &[u8], size: i32) -> Option<isize> {
         HDC(std::ptr::null_mut()), &bmi, DIB_RGB_COLORS, &mut bits, None, 0,
     ).ok()?;
 
-    let buf = std::slice::from_raw_parts_mut(
+    // Decode scaled pixels into a temporary buffer, then copy into the centred position
+    let img_stride = (dst_w * 4) as u32;
+    let mut img_buf = vec![0u8; (img_stride * dst_h as u32) as usize];
+    converter.CopyPixels(std::ptr::null(), img_stride, &mut img_buf).ok()?;
+
+    let dst_pixels = std::slice::from_raw_parts_mut(
         bits as *mut u8,
         (stride * size as u32) as usize,
     );
-    converter.CopyPixels(std::ptr::null(), stride, buf).ok()?;
+    for row in 0..dst_h as usize {
+        let src = row * img_stride as usize;
+        let dst = (y_off as usize + row) * stride as usize + x_off as usize * 4;
+        dst_pixels[dst..dst + img_stride as usize]
+            .copy_from_slice(&img_buf[src..src + img_stride as usize]);
+    }
+
     Some(hbmp.0 as isize)
 }
 
@@ -812,7 +835,7 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
         if let Some(ref cached) = *cache {
             let art_dc = CreateCompatibleDC(mdc);
             let old = SelectObject(art_dc, HBITMAP(cached.hbmp as *mut _));
-            let _ = StretchBlt(mdc, 0, art_top, art_w, art_h, art_dc, 0, 0, art_w, art_w, SRCCOPY);
+            let _ = BitBlt(mdc, 0, art_top, art_w, art_h, art_dc, 0, 0, SRCCOPY);
             SelectObject(art_dc, old);
             let _ = DeleteDC(art_dc);
         } else {
