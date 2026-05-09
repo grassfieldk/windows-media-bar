@@ -2,11 +2,20 @@
 name = "windows-media-bar"
 version = "0.1.0"
 edition = "2021"
+description = "A lightweight Windows media control bar that docks to the bottom of your screen"
+repository = "https://github.com/grassfieldk/windows-media-bar"
 license = "MIT"
 
 [[bin]]
 name = "windows-media-bar"
 path = "src/main.rs"
+
+[build-dependencies]
+winres     = "0.1"
+resvg      = "0.44"
+usvg       = "0.44"
+tiny-skia  = "0.11"
+ico        = "0.3"
 
 [dependencies]
 windows = { version = "0.58", features = [

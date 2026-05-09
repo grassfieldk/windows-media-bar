@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v1.0.0)"
+        required: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version tag
+        id: tag
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            echo "TAG=${{ inputs.version }}" >> $env:GITHUB_ENV
+          } else {
+            echo "TAG=${{ github.ref_name }}" >> $env:GITHUB_ENV
+          }
+        shell: pwsh
+
+      - name: Install Rust stable (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Rename artifact
+        run: |
+          $src = "target\x86_64-pc-windows-msvc\release\windows-media-bar.exe"
+          $dst = "windows-media-bar-${{ env.TAG }}-x86_64.exe"
+          Copy-Item $src $dst
+          echo "ARTIFACT=$dst" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: ${{ env.ARTIFACT }}
+          generate_release_notes: true
