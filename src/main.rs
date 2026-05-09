@@ -104,18 +104,25 @@ struct CachedArt {
     hbmp: isize,
 }
 
+struct MonitorInfo {
+    rect:    RECT,
+    primary: bool,
+}
+
 struct Settings {
-    bar_h:     i32,
-    font_face: String,
-    font_size: i32,
+    bar_h:       i32,
+    font_face:   String,
+    font_size:   i32,
+    monitor_idx: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            bar_h:     DEFAULT_BAR_H,
-            font_face: DEFAULT_FONT_FACE.to_string(),
-            font_size: DEFAULT_FONT_SIZE,
+            bar_h:       DEFAULT_BAR_H,
+            font_face:   DEFAULT_FONT_FACE.to_string(),
+            font_size:   DEFAULT_FONT_SIZE,
+            monitor_idx: 0,
         }
     }
 }
@@ -193,6 +200,15 @@ fn load_settings() -> Settings {
             }
         }
 
+        let mut val = 0u32;
+        let mut sz  = 4u32;
+        if RegQueryValueExW(key, w!("MonitorIdx"), None, Some(&mut ty),
+            Some(&mut val as *mut u32 as *mut u8), Some(&mut sz)) == ERROR_SUCCESS
+            && ty == REG_DWORD
+        {
+            s.monitor_idx = val;
+        }
+
         let _ = RegCloseKey(key);
     }
     s
@@ -216,6 +232,10 @@ fn save_settings(s: &Settings) {
         let wide: Vec<u16> = s.font_face.encode_utf16().chain([0u16]).collect();
         let _ = RegSetValueExW(key, w!("FontFace"), 0, REG_SZ,
             Some(std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)));
+
+        let v = s.monitor_idx;
+        let _ = RegSetValueExW(key, w!("MonitorIdx"), 0, REG_DWORD,
+            Some(std::slice::from_raw_parts(&v as *const u32 as *const u8, 4)));
 
         let _ = RegCloseKey(key);
     }
@@ -262,18 +282,64 @@ fn set_startup(enable: bool) {
     }
 }
 
+unsafe extern "system" fn monitor_enum_proc(
+    hmon: HMONITOR, _: HDC, _: *mut RECT, lparam: LPARAM,
+) -> BOOL {
+    let list = &mut *(lparam.0 as *mut Vec<MonitorInfo>);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+        list.push(MonitorInfo { rect: mi.rcMonitor, primary: mi.dwFlags & 1 != 0 });
+    }
+    BOOL(1)
+}
+
+fn enum_monitors() -> Vec<MonitorInfo> {
+    let mut list: Vec<MonitorInfo> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC::default(), None,
+            Some(monitor_enum_proc),
+            LPARAM(&mut list as *mut Vec<MonitorInfo> as isize),
+        );
+    }
+    list.sort_by_key(|m| (m.rect.left, m.rect.top));
+    list
+}
+
 unsafe fn show_context_menu(hwnd: HWND) {
     let registered = is_startup_registered();
-    let menu = CreatePopupMenu().unwrap();
+    let sp         = STATE_PTR.load(Ordering::Relaxed);
+    let monitors   = enum_monitors();
 
+    let current_idx = if !sp.is_null() {
+        (*sp).settings.lock().unwrap().monitor_idx as usize
+    } else { 0 };
+    let effective_idx = current_idx.min(monitors.len().saturating_sub(1));
+
+    let menu = CreatePopupMenu().unwrap();
     let _ = AppendMenuW(menu, MF_STRING, 3, w!("設定 (&P)"));
+
+    if monitors.len() > 1 {
+        let sub = CreatePopupMenu().unwrap();
+        for (i, mon) in monitors.iter().enumerate() {
+            let label = if mon.primary {
+                format!("ディスプレイ {} (プライマリ)", i + 1)
+            } else {
+                format!("ディスプレイ {}", i + 1)
+            };
+            let wide: Vec<u16> = label.encode_utf16().chain([0u16]).collect();
+            let flags = if i == effective_idx { MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(sub, flags, 100 + i, PCWSTR(wide.as_ptr()));
+        }
+        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("表示画面 (&D)"));
+    }
+
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR(std::ptr::null()));
     let _ = AppendMenuW(menu, MF_STRING, 1, w!("スタートアップ時に起動 (&S)"));
-    let check_flag = if registered {
-        MF_BYCOMMAND | MF_CHECKED
-    } else {
-        MF_BYCOMMAND | MF_UNCHECKED
-    };
+    let check_flag = if registered { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND | MF_UNCHECKED };
     let _ = CheckMenuItem(menu, 1, check_flag.0);
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR(std::ptr::null()));
     let _ = AppendMenuW(menu, MF_STRING, 2, w!("終了 (&X)"));
@@ -289,14 +355,24 @@ unsafe fn show_context_menu(hwnd: HWND) {
     );
     let _ = DestroyMenu(menu);
 
-    match cmd.0 {
-        1 => set_startup(!registered),
-        2 => { let _ = DestroyWindow(hwnd); }
-        3 => {
-            let sp = STATE_PTR.load(Ordering::Relaxed);
-            if !sp.is_null() { open_settings(hwnd, sp); }
+    let cmd_val = cmd.0 as usize;
+    if cmd_val >= 100 && cmd_val < 100 + monitors.len() {
+        let new_idx = (cmd_val - 100) as u32;
+        if !sp.is_null() {
+            {
+                let mut s = (*sp).settings.lock().unwrap();
+                s.monitor_idx = new_idx;
+                save_settings(&s);
+            }
+            apply_settings(hwnd, &*sp);
         }
-        _ => {}
+    } else {
+        match cmd.0 {
+            1 => set_startup(!registered),
+            2 => { let _ = DestroyWindow(hwnd); }
+            3 => { if !sp.is_null() { open_settings(hwnd, sp); } }
+            _ => {}
+        }
     }
 }
 
@@ -418,18 +494,28 @@ fn seek_to(pos_100ns: i64, hwnd_raw: isize) {
 }
 
 // ── AppBar ────────────────────────────────────────────────────────────────────
-fn appbar_register(hwnd: HWND, sw: i32, sh: i32, bar_h: i32) -> RECT {
+fn appbar_register(hwnd: HWND, mon_rect: RECT, bar_h: i32) -> RECT {
     unsafe {
         let mut d = APPBARDATA {
             cbSize: std::mem::size_of::<APPBARDATA>() as u32,
             hWnd: hwnd,
             uCallbackMessage: WM_APPBAR,
             uEdge: ABE_BOTTOM,
-            rc: RECT { left: 0, top: sh - bar_h, right: sw, bottom: sh },
+            rc: RECT {
+                left:   mon_rect.left,
+                top:    mon_rect.bottom - bar_h,
+                right:  mon_rect.right,
+                bottom: mon_rect.bottom,
+            },
             lParam: LPARAM(0),
         };
         SHAppBarMessage(ABM_NEW, &mut d);
-        d.rc = RECT { left: 0, top: sh - bar_h, right: sw, bottom: sh };
+        d.rc = RECT {
+            left:   mon_rect.left,
+            top:    mon_rect.bottom - bar_h,
+            right:  mon_rect.right,
+            bottom: mon_rect.bottom,
+        };
         SHAppBarMessage(ABM_QUERYPOS, &mut d);
         d.rc.top = d.rc.bottom - bar_h;
         SHAppBarMessage(ABM_SETPOS, &mut d);
@@ -842,9 +928,9 @@ static SETTINGS_HWND: std::sync::atomic::AtomicIsize =
     std::sync::atomic::AtomicIsize::new(0);
 
 unsafe fn apply_settings(hwnd_main: HWND, state: &AppState) {
-    let (bar_h, font_face, font_size) = {
+    let (bar_h, font_face, font_size, monitor_idx) = {
         let s = state.settings.lock().unwrap();
-        (s.bar_h, s.font_face.clone(), s.font_size)
+        (s.bar_h, s.font_face.clone(), s.font_size, s.monitor_idx as usize)
     };
 
     let face_wide: Vec<u16> = font_face.encode_utf16().chain([0u16]).collect();
@@ -862,9 +948,18 @@ unsafe fn apply_settings(hwnd_main: HWND, state: &AppState) {
     }
 
     appbar_remove(hwnd_main);
-    let sw = GetSystemMetrics(SM_CXSCREEN);
-    let sh = GetSystemMetrics(SM_CYSCREEN);
-    let rc = appbar_register(hwnd_main, sw, sh, bar_h);
+    let monitors = enum_monitors();
+    let mon_rect = if monitors.is_empty() {
+        RECT {
+            left:   0,
+            top:    0,
+            right:  GetSystemMetrics(SM_CXSCREEN),
+            bottom: GetSystemMetrics(SM_CYSCREEN),
+        }
+    } else {
+        monitors[monitor_idx.min(monitors.len() - 1)].rect
+    };
+    let rc = appbar_register(hwnd_main, mon_rect, bar_h);
     let _ = SetWindowPos(
         hwnd_main, HWND_TOP,
         rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
@@ -1260,22 +1355,32 @@ fn main() -> Result<()> {
         };
         RegisterClassExW(&sc);
 
-        let settings = load_settings();
-        let bar_h    = settings.bar_h;
-
-        let sw = GetSystemMetrics(SM_CXSCREEN);
-        let sh = GetSystemMetrics(SM_CYSCREEN);
+        let settings    = load_settings();
+        let bar_h       = settings.bar_h;
+        let monitors    = enum_monitors();
+        let mon_idx     = (settings.monitor_idx as usize).min(monitors.len().saturating_sub(1));
+        let mon_rect    = if monitors.is_empty() {
+            RECT {
+                left:   0,
+                top:    0,
+                right:  GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
+            }
+        } else {
+            monitors[mon_idx].rect
+        };
 
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("MediaBarClass"),
             w!("MediaBar"),
             WS_POPUP | WS_VISIBLE,
-            0, sh - bar_h, sw, bar_h,
+            mon_rect.left, mon_rect.bottom - bar_h,
+            mon_rect.right - mon_rect.left, bar_h,
             None, None, hinstance, None,
         )?;
 
-        let rc = appbar_register(hwnd, sw, sh, bar_h);
+        let rc = appbar_register(hwnd, mon_rect, bar_h);
         SetWindowPos(
             hwnd, HWND_TOP,
             rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
