@@ -31,12 +31,12 @@ const ACCENT_H: i32 = 1;
 const BTN_W:    i32 = 36;
 const BTN_H:    i32 = 26;
 const GROUP_W:  i32 = BTN_W * 3; // = 108
-const SIDE_PAD: i32 = 8;
+const SIDE_PAD: i32 = 16;
 const CORNER:   i32 = 6;
 
 const SEEK_W:     i32 = 360;
 const SEEK_H:     i32 = 3;
-const SEEK_PAD_R: i32 = 12;
+const SEEK_PAD_R: i32 = 24;
 const TIME_W:     i32 = 82;
 const TIME_GAP:   i32 = 16;
 
@@ -948,17 +948,17 @@ unsafe fn draw_media_text(dc: HDC, info: &MediaInfo, font: HFONT, x: i32, max_x:
 
     if info.artist.is_empty() { SelectObject(dc, of); return; }
 
-    let mut sep = w16(" - ");
+    let mut sep = w16("-");
     let mut ssz = SIZE::default();
     let _ = GetTextExtentPoint32W(dc, &sep, &mut ssz);
-    let sep_x = x + title_alloc + 2;
-    if sep_x + ssz.cx >= x + avail { SelectObject(dc, of); return; }
+    let sep_x = x + title_alloc + 6;
+    if sep_x + ssz.cx + 6 >= x + avail { SelectObject(dc, of); return; }
 
     SetTextColor(dc, COLORREF(C_SEP));
     let mut sr = RECT { left: sep_x, top, right: sep_x + ssz.cx, bottom: h };
     DrawTextW(dc, &mut sep, &mut sr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    let art_x = sep_x + ssz.cx;
+    let art_x = sep_x + ssz.cx + 6;
     let art_w = x + avail - art_x;
     if art_w > 20 {
         SetTextColor(dc, COLORREF(C_ARTIST));
@@ -980,7 +980,7 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
     let art_w   = h;
     let group_x = h + SIDE_PAD;
     let shr_x   = group_x + GROUP_W + SHR_GAP;
-    let text_x  = shr_x + SHR_W * 2 + 10;
+    let text_x  = shr_x + SHR_W * 2 + 20;
 
     let mdc = CreateCompatibleDC(hdc);
     let bmp = CreateCompatibleBitmap(hdc, w, h);
