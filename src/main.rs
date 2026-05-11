@@ -43,7 +43,9 @@ const TIME_GAP:   i32 = 16;
 // Dynamic layout (computed from h = bar_h at runtime):
 //   art_w   = h
 //   group_x = h + SIDE_PAD
-//   text_x  = group_x + GROUP_W + 14
+//   shr_x   = group_x + GROUP_W + SHR_GAP   (start of shuffle/repeat group)
+//   rep_x   = shr_x + SHR_W                 (repeat button within that group)
+//   text_x  = shr_x + SHR_W * 2 + 10
 
 // ── colours (COLORREF = 0x00_BB_GG_RR) ───────────────────────────────────────
 const C_BG:           u32 = 0x00_1C_1C_1C;
@@ -63,7 +65,14 @@ const ICON_PREV:  &str = "\u{E892}";
 const ICON_PLAY:  &str = "\u{E768}";
 const ICON_PAUSE: &str = "\u{E769}";
 const ICON_NEXT:  &str = "\u{E893}";
-const ICON_GEAR:  &str = "\u{E713}"; // Settings gear (Segoe MDL2 Assets)
+const ICON_GEAR:       &str = "\u{E713}"; // Settings gear (Segoe MDL2 Assets)
+const ICON_SHUFFLE:    &str = "\u{E8B1}"; // Shuffle
+const ICON_REPEAT_ALL: &str = "\u{E8EE}"; // Repeat all
+const ICON_REPEAT_ONE: &str = "\u{E8ED}"; // Repeat one
+
+// ── shuffle/repeat group ──────────────────────────────────────────────────────
+const SHR_W:   i32 = 28; // each shuffle/repeat button width
+const SHR_GAP: i32 = 8;  // gap from play-group to the shuffle/repeat group
 
 // ── gear button ───────────────────────────────────────────────────────────────
 const GEAR_W:   i32 = 32; // gear button width
@@ -87,16 +96,20 @@ const SETTINGS_KEY: PCWSTR = w!("Software\\MediaBar");
 
 // ── types ─────────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Default)]
-enum Hover { #[default] None, Prev, Play, Next, Gear }
+enum Hover { #[default] None, Prev, Play, Next, Shuffle, Repeat, Gear }
 
 #[derive(Clone, Default)]
 struct MediaInfo {
-    title:          String,
-    artist:         String,
-    playing:        bool,
-    thumbnail:      Option<Arc<Vec<u8>>>,
-    position_100ns: i64,
-    duration_100ns: i64,
+    title:           String,
+    artist:          String,
+    playing:         bool,
+    thumbnail:       Option<Arc<Vec<u8>>>,
+    position_100ns:  i64,
+    duration_100ns:  i64,
+    shuffle:         bool,
+    repeat:          Option<windows::Media::MediaPlaybackAutoRepeatMode>,
+    shuffle_enabled: bool,
+    repeat_enabled:  bool,
 }
 
 struct CachedArt {
@@ -395,6 +408,17 @@ fn fetch_media_info(prev_title: &str, prev_thumb: Option<Arc<Vec<u8>>>) -> Optio
     let s = mgr.GetCurrentSession().ok()?;
     let p = s.TryGetMediaPropertiesAsync().ok()?.get().ok()?;
     let pb = s.GetPlaybackInfo().ok()?;
+    if pb.PlaybackType().ok().and_then(|r| r.Value().ok())
+        == Some(windows::Media::MediaPlaybackType::Video)
+    {
+        return None;
+    }
+    let controls       = pb.Controls().ok();
+    let shuffle_enabled = controls.as_ref().and_then(|c| c.IsShuffleEnabled().ok()).unwrap_or(false);
+    let repeat_enabled  = controls.as_ref().and_then(|c| c.IsRepeatEnabled().ok()).unwrap_or(false);
+    let shuffle = pb.IsShuffleActive().ok().and_then(|r| r.Value().ok()).unwrap_or(false);
+    let repeat  = pb.AutoRepeatMode().ok().and_then(|r| r.Value().ok());
+
     let title = p.Title().ok().map(|s| s.to_string()).unwrap_or_default();
     let thumbnail = if title == prev_title {
         prev_thumb
@@ -418,6 +442,10 @@ fn fetch_media_info(prev_title: &str, prev_thumb: Option<Arc<Vec<u8>>>) -> Optio
         thumbnail,
         position_100ns,
         duration_100ns,
+        shuffle,
+        repeat,
+        shuffle_enabled,
+        repeat_enabled,
     })
 }
 
@@ -433,6 +461,24 @@ fn send_cmd(cmd: &str, hwnd_raw: isize) {
                 "prev" => { let _ = s.TrySkipPreviousAsync().and_then(|a| a.get()); }
                 "play" => { let _ = s.TryTogglePlayPauseAsync().and_then(|a| a.get()); }
                 "next" => { let _ = s.TrySkipNextAsync().and_then(|a| a.get()); }
+                "shuffle" => {
+                    let pb  = s.GetPlaybackInfo().ok()?;
+                    let cur = pb.IsShuffleActive().ok()
+                        .and_then(|r| r.Value().ok())
+                        .unwrap_or(false);
+                    let _ = s.TryChangeShuffleActiveAsync(!cur).and_then(|a| a.get());
+                }
+                "repeat" => {
+                    use windows::Media::MediaPlaybackAutoRepeatMode as Mode;
+                    let pb  = s.GetPlaybackInfo().ok()?;
+                    let cur = pb.AutoRepeatMode().ok().and_then(|r| r.Value().ok());
+                    let next = match cur {
+                        None | Some(Mode::None) => Mode::List,
+                        Some(Mode::List)        => Mode::Track,
+                        _                       => Mode::None,
+                    };
+                    let _ = s.TryChangeAutoRepeatModeAsync(next).and_then(|a| a.get());
+                }
                 _ => {}
             }
             Some(())
@@ -540,13 +586,15 @@ fn fmt_time(t_100ns: i64) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-fn hit_btn(x: i32, group_x: i32, gear_x: i32) -> Hover {
+fn hit_btn(x: i32, group_x: i32, shr_x: i32, rep_x: i32, gear_x: i32) -> Hover {
     let prev_x = group_x;
     let play_x = group_x + BTN_W;
     let next_x = group_x + BTN_W * 2;
-    if      (prev_x..prev_x + BTN_W).contains(&x) { Hover::Prev }
-    else if (play_x..play_x + BTN_W).contains(&x) { Hover::Play }
-    else if (next_x..next_x + BTN_W).contains(&x) { Hover::Next }
+    if      (prev_x..prev_x + BTN_W).contains(&x)  { Hover::Prev }
+    else if (play_x..play_x + BTN_W).contains(&x)  { Hover::Play }
+    else if (next_x..next_x + BTN_W).contains(&x)  { Hover::Next }
+    else if (shr_x..shr_x + SHR_W).contains(&x)    { Hover::Shuffle }
+    else if (rep_x..rep_x + SHR_W).contains(&x)    { Hover::Repeat }
     else if (gear_x..gear_x + GEAR_W).contains(&x) { Hover::Gear }
     else                                            { Hover::None }
 }
@@ -741,6 +789,77 @@ unsafe fn draw_gear_btn(dc: HDC, gx: i32, gy: i32, hovered: bool, font: HFONT) {
     SelectObject(dc, of);
 }
 
+unsafe fn draw_shr_group(
+    dc: HDC, gx: i32, gy: i32, hover: Hover,
+    shuffle_active: bool, shuffle_enabled: bool,
+    repeat_active:  bool, repeat_enabled:  bool,
+    rep_icon: &str, font: HFONT, accent: u32,
+) {
+    let total_w = SHR_W * 2;
+    let gx2 = gx + total_w;
+    let gy2 = gy + BTN_H;
+
+    // Background — clipped to rounded rect
+    let saved = SaveDC(dc);
+    let rgn = CreateRoundRectRgn(gx, gy, gx2 + 1, gy2 + 1, CORNER, CORNER);
+    SelectClipRgn(dc, rgn);
+    let bg_br = CreateSolidBrush(COLORREF(C_BTN));
+    FillRect(dc, &RECT { left: gx, top: gy, right: gx2, bottom: gy2 }, bg_br);
+    let _ = DeleteObject(bg_br);
+
+    // Hover highlight on the hovered half
+    let hx_opt = match hover {
+        Hover::Shuffle => Some(gx),
+        Hover::Repeat  => Some(gx + SHR_W),
+        _              => None,
+    };
+    if let Some(hx) = hx_opt {
+        let hov_br = CreateSolidBrush(COLORREF(C_BTN_HOV));
+        FillRect(dc, &RECT { left: hx, top: gy, right: hx + SHR_W, bottom: gy2 }, hov_br);
+        let _ = DeleteObject(hov_br);
+    }
+    let _ = RestoreDC(dc, saved);
+    let _ = DeleteObject(rgn);
+
+    // Border
+    let bdr = if hx_opt.is_some() { C_BTN_BDR_H } else { C_BTN_BDR };
+    let pn = CreatePen(PS_SOLID, 1, COLORREF(bdr));
+    let op = SelectObject(dc, pn);
+    let ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    let _ = RoundRect(dc, gx, gy, gx2, gy2, CORNER, CORNER);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    let _ = DeleteObject(pn);
+
+    // Divider
+    let div_pn = CreatePen(PS_SOLID, 1, COLORREF(C_BTN_BDR));
+    let op = SelectObject(dc, div_pn);
+    let margin = 4;
+    let _ = MoveToEx(dc, gx + SHR_W, gy + margin, None);
+    let _ = LineTo  (dc, gx + SHR_W, gy2 - margin);
+    SelectObject(dc, op);
+    let _ = DeleteObject(div_pn);
+
+    // Icons — accent color when active, dim when not enabled, normal otherwise
+    let icons: [(&str, bool, bool); 2] = [
+        (ICON_SHUFFLE, shuffle_active, shuffle_enabled),
+        (rep_icon,     repeat_active,  repeat_enabled),
+    ];
+    let of = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    for (i, (icon, active, enabled)) in icons.iter().enumerate() {
+        let ix = gx + i as i32 * SHR_W;
+        let icon_color = if !enabled { 0x00_55_55_55u32 }
+                         else if *active { accent }
+                         else { C_ICON };
+        SetTextColor(dc, COLORREF(icon_color));
+        let mut wide = w16(icon);
+        let mut r = RECT { left: ix, top: gy, right: ix + SHR_W, bottom: gy2 };
+        DrawTextW(dc, &mut wide, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(dc, of);
+}
+
 unsafe fn draw_media_text(dc: HDC, info: &MediaInfo, font: HFONT, x: i32, max_x: i32, h: i32) {
     let of = SelectObject(dc, font);
     SetBkMode(dc, TRANSPARENT);
@@ -802,7 +921,8 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
     // Layout derived from the actual window height
     let art_w   = h;
     let group_x = h + SIDE_PAD;
-    let text_x  = group_x + GROUP_W + 14;
+    let shr_x   = group_x + GROUP_W + SHR_GAP;
+    let text_x  = shr_x + SHR_W * 2 + 10;
 
     let mdc = CreateCompatibleDC(hdc);
     let bmp = CreateCompatibleBitmap(hdc, w, h);
@@ -848,7 +968,19 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
 
     let btn_top  = ACCENT_H + (h - ACCENT_H - BTN_H) / 2;
     let font_btn = HFONT(state.font_btn.load(Ordering::Relaxed) as *mut _);
+    let accent   = state.accent.load(Ordering::Relaxed);
     draw_btn_group(mdc, btn_top, group_x, hover, info.playing, font_btn);
+
+    // Shuffle/repeat group — grouped button pair to the right of the play group
+    {
+        use windows::Media::MediaPlaybackAutoRepeatMode as Mode;
+        let rep_icon    = if info.repeat == Some(Mode::Track) { ICON_REPEAT_ONE } else { ICON_REPEAT_ALL };
+        let repeat_active = info.repeat.map(|r| r != Mode::None).unwrap_or(false);
+        draw_shr_group(mdc, shr_x, btn_top, hover,
+            info.shuffle,  info.shuffle_enabled,
+            repeat_active, info.repeat_enabled,
+            rep_icon, font_btn, accent);
+    }
 
     // Gear button sits at the far right; everything else is pushed left of it.
     let gear_x   = w - GEAR_PAD - GEAR_W;
@@ -892,7 +1024,7 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
             .unwrap_or(display_pos as f64 / info.duration_100ns as f64);
         let fill_w = (SEEK_W as f64 * frac) as i32;
         if fill_w > 0 {
-            let fill_br = CreateSolidBrush(COLORREF(state.accent.load(Ordering::Relaxed)));
+            let fill_br = CreateSolidBrush(COLORREF(accent));
             let fill_rc = RECT { left: sx, top: sy, right: sx + fill_w, bottom: sy + SEEK_H };
             FillRect(mdc, &fill_rc, fill_br);
             let _ = DeleteObject(fill_br);
@@ -935,7 +1067,7 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
 
     // Accent border — drawn last so it always renders on top
     let acc_rc = RECT { left: 0, top: 0, right: w, bottom: ACCENT_H };
-    let acc = CreateSolidBrush(COLORREF(state.accent.load(Ordering::Relaxed)));
+    let acc = CreateSolidBrush(COLORREF(accent));
     FillRect(mdc, &acc_rc, acc);
     let _ = DeleteObject(acc);
 
@@ -1235,6 +1367,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
                 let group_x = rc.bottom + SIDE_PAD;
+                let shr_x   = group_x + GROUP_W + SHR_GAP;
+                let rep_x   = shr_x + SHR_W;
                 let gear_x  = rc.right - GEAR_PAD - GEAR_W;
 
                 let dragging = {
@@ -1250,7 +1384,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if dragging {
                     let _ = InvalidateRect(hwnd, None, false);
                 } else {
-                    let new_hover = hit_btn(x, group_x, gear_x);
+                    let new_hover = hit_btn(x, group_x, shr_x, rep_x, gear_x);
                     let mut hov = (*sp).hover.lock().unwrap();
                     if *hov != new_hover {
                         *hov = new_hover;
@@ -1297,6 +1431,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let gear_x  = rc.right - GEAR_PAD - GEAR_W;
             let sx      = gear_x - SEEK_PAD_R - SEEK_W;
             let group_x = rc.bottom + SIDE_PAD;
+            let shr_x   = group_x + GROUP_W + SHR_GAP;
+            let rep_x   = shr_x + SHR_W;
 
             if x >= sx && x < sx + SEEK_W && !sp.is_null() {
                 let dur = (*sp).info.lock().unwrap().duration_100ns;
@@ -1307,12 +1443,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             } else {
-                match hit_btn(x, group_x, gear_x) {
-                    Hover::Prev => send_cmd("prev", hw),
-                    Hover::Play => send_cmd("play", hw),
-                    Hover::Next => send_cmd("next", hw),
-                    Hover::Gear => { if !sp.is_null() { open_settings(hwnd, sp); } }
-                    Hover::None => {}
+                match hit_btn(x, group_x, shr_x, rep_x, gear_x) {
+                    Hover::Prev    => send_cmd("prev", hw),
+                    Hover::Play    => send_cmd("play", hw),
+                    Hover::Next    => send_cmd("next", hw),
+                    Hover::Shuffle => send_cmd("shuffle", hw),
+                    Hover::Repeat  => send_cmd("repeat", hw),
+                    Hover::Gear    => { if !sp.is_null() { open_settings(hwnd, sp); } }
+                    Hover::None    => {}
                 }
             }
             LRESULT(0)
