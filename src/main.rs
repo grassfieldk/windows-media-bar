@@ -113,9 +113,12 @@ struct MediaInfo {
 }
 
 struct CachedArt {
-    key:  String,
-    hbmp: isize,
+    key:     String,
+    hbmp:    isize, // small (art_w×art_w) — left thumbnail
+    hbmp_bg: isize, // large (BG_ART_SIZE×BG_ART_SIZE) — blurred background
 }
+
+const BG_ART_SIZE: i32 = 300;
 
 struct MonitorInfo {
     rect:    RECT,
@@ -615,6 +618,61 @@ unsafe fn make_font(face: PCWSTR, px: i32) -> HFONT {
     )
 }
 
+// Separable box blur on a top-down 32bpp BGRA pixel buffer.
+// Two passes (H then V) applied twice gives a smooth Gaussian-like result.
+fn box_blur_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    let cnt = (2 * r + 1) as u32;
+    for y in 0..h {
+        let base = y * w * 4;
+        let mut sums = [0u32; 3];
+        // Init window centered at x=0: offsets -r..+r, left side clamps to pixel 0
+        for i in 0..=(2 * r) {
+            let sx = if i < r { 0 } else { (i - r).min(w - 1) };
+            for c in 0..3 { sums[c] += src[base + sx * 4 + c] as u32; }
+        }
+        for x in 0..w {
+            for c in 0..3 { dst[base + x * 4 + c] = (sums[c] / cnt) as u8; }
+            dst[base + x * 4 + 3] = src[base + x * 4 + 3];
+            let add_x = (x + r + 1).min(w - 1);
+            let rem_x = x.saturating_sub(r);
+            for c in 0..3 {
+                sums[c] += src[base + add_x * 4 + c] as u32;
+                sums[c] -= src[base + rem_x * 4 + c] as u32;
+            }
+        }
+    }
+}
+
+fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    let cnt = (2 * r + 1) as u32;
+    for x in 0..w {
+        let mut sums = [0u32; 3];
+        // Init window centered at y=0: offsets -r..+r, top clamps to row 0
+        for i in 0..=(2 * r) {
+            let sy = if i < r { 0 } else { (i - r).min(h - 1) };
+            for c in 0..3 { sums[c] += src[sy * w * 4 + x * 4 + c] as u32; }
+        }
+        for y in 0..h {
+            for c in 0..3 { dst[y * w * 4 + x * 4 + c] = (sums[c] / cnt) as u8; }
+            dst[y * w * 4 + x * 4 + 3] = src[y * w * 4 + x * 4 + 3];
+            let add_y = (y + r + 1).min(h - 1);
+            let rem_y = y.saturating_sub(r);
+            for c in 0..3 {
+                sums[c] += src[add_y * w * 4 + x * 4 + c] as u32;
+                sums[c] -= src[rem_y * w * 4 + x * 4 + c] as u32;
+            }
+        }
+    }
+}
+
+fn apply_blur(pixels: &mut [u8], w: usize, h: usize, radius: usize) {
+    let mut tmp = vec![0u8; pixels.len()];
+    for _ in 0..2 {
+        box_blur_h(pixels, &mut tmp, w, h, radius);
+        box_blur_v(&tmp, pixels, w, h, radius);
+    }
+}
+
 unsafe fn decode_thumbnail(bytes: &[u8], size: i32) -> Option<isize> {
     let stream = SHCreateMemStream(Some(bytes))?;
     let factory: IWICImagingFactory =
@@ -928,40 +986,109 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
     let bmp = CreateCompatibleBitmap(hdc, w, h);
     let old_bmp = SelectObject(mdc, bmp);
 
-    let bg = CreateSolidBrush(COLORREF(C_BG));
-    FillRect(mdc, &rc, bg);
-    let _ = DeleteObject(bg);
-
     let info  = state.info.lock().unwrap().clone();
     let hover = *state.hover.lock().unwrap();
 
-    // Album art
+    // Album art — also drives the blurred bar background
     let art_top = ACCENT_H;
     let art_h   = h - ACCENT_H;
     {
         let mut cache = state.art.lock().unwrap();
         if cache.as_ref().map(|c| c.key.as_str()) != Some(info.title.as_str()) {
             if let Some(old) = cache.take() {
-                let _ = DeleteObject(HBITMAP(old.hbmp as *mut _));
+                let _ = DeleteObject(HBITMAP(old.hbmp    as *mut _));
+                let _ = DeleteObject(HBITMAP(old.hbmp_bg as *mut _));
             }
             if !info.title.is_empty() {
                 if let Some(ref bytes) = info.thumbnail {
-                    if let Some(hbmp) = decode_thumbnail(bytes, art_w) {
-                        *cache = Some(CachedArt { key: info.title.clone(), hbmp });
+                    if let (Some(hbmp), Some(hbmp_bg)) = (
+                        decode_thumbnail(bytes, art_w),
+                        decode_thumbnail(bytes, BG_ART_SIZE),
+                    ) {
+                        *cache = Some(CachedArt { key: info.title.clone(), hbmp, hbmp_bg });
                     }
                 }
             }
         }
+
         if let Some(ref cached) = *cache {
+            // ── blurred background ────────────────────────────────────────────
+            // 1. StretchBlt the center crop of hbmp_bg into a full-bar-size DIB.
+            // 2. Apply a software separable box blur directly on the pixel data.
+            // This gives a real blur at full resolution — no downscale artefacts.
+            let src_dc = CreateCompatibleDC(mdc);
+            let old_src = SelectObject(src_dc, HBITMAP(cached.hbmp_bg as *mut _));
+
+            let bg_sz   = BG_ART_SIZE;
+            let src_h_f = bg_sz as f64 * h as f64 / w as f64;
+            let src_h_i = (src_h_f.ceil() as i32).max(1).min(bg_sz);
+            let src_y   = ((bg_sz - src_h_i) / 2).max(0);
+
+            let mut bg_bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let bg_bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize:        std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth:       w,
+                    biHeight:      -h, // top-down
+                    biPlanes:      1,
+                    biBitCount:    32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                bmiColors: [RGBQUAD::default()],
+            };
+            if let Ok(bg_dib) = CreateDIBSection(
+                HDC(std::ptr::null_mut()), &bg_bmi, DIB_RGB_COLORS, &mut bg_bits, None, 0,
+            ) {
+                let bg_dc  = CreateCompatibleDC(mdc);
+                let old_bg = SelectObject(bg_dc, bg_dib);
+                SetStretchBltMode(bg_dc, HALFTONE);
+                let _ = StretchBlt(bg_dc, 0, 0, w, h,
+                                   src_dc, 0, src_y, bg_sz, src_h_i, SRCCOPY);
+
+                // Apply blur directly on the DIB pixel buffer
+                let pixel_count = (w * h * 4) as usize;
+                let pixels = std::slice::from_raw_parts_mut(bg_bits as *mut u8, pixel_count);
+                apply_blur(pixels, w as usize, h as usize, 12);
+
+                // Copy blurred result to the back buffer
+                let _ = BitBlt(mdc, 0, 0, w, h, bg_dc, 0, 0, SRCCOPY);
+
+                SelectObject(bg_dc, old_bg);
+                let _ = DeleteDC(bg_dc);
+                let _ = DeleteObject(bg_dib);
+            }
+            SelectObject(src_dc, old_src);
+            let _ = DeleteDC(src_dc);
+
+            // ── dark overlay ──────────────────────────────────────────────────
+            let ov_dc  = CreateCompatibleDC(mdc);
+            let ov_bmp = CreateCompatibleBitmap(mdc, 1, 1);
+            let old_ov = SelectObject(ov_dc, ov_bmp);
+            let blk_br = CreateSolidBrush(COLORREF(0));
+            FillRect(ov_dc, &RECT { left: 0, top: 0, right: 1, bottom: 1 }, blk_br);
+            let _ = DeleteObject(blk_br);
+            let bf = BLENDFUNCTION {
+                BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 170, AlphaFormat: 0,
+            };
+            let _ = AlphaBlend(mdc, 0, 0, w, h, ov_dc, 0, 0, 1, 1, bf);
+            SelectObject(ov_dc, old_ov);
+            let _ = DeleteObject(ov_bmp);
+            let _ = DeleteDC(ov_dc);
+
+            // ── album art thumbnail (small, crisp, on top of blurred BG) ─────
             let art_dc = CreateCompatibleDC(mdc);
-            let old = SelectObject(art_dc, HBITMAP(cached.hbmp as *mut _));
+            let old_a  = SelectObject(art_dc, HBITMAP(cached.hbmp as *mut _));
             let _ = BitBlt(mdc, 0, art_top, art_w, art_h, art_dc, 0, 0, SRCCOPY);
-            SelectObject(art_dc, old);
+            SelectObject(art_dc, old_a);
             let _ = DeleteDC(art_dc);
         } else {
-            let ph    = RECT { left: 0, top: art_top, right: art_w, bottom: h };
+            // No art: solid dark background + placeholder square
+            let bg = CreateSolidBrush(COLORREF(C_BG));
+            FillRect(mdc, &rc, bg);
+            let _ = DeleteObject(bg);
             let ph_br = CreateSolidBrush(COLORREF(C_ART_PH));
-            FillRect(mdc, &ph, ph_br);
+            FillRect(mdc, &RECT { left: 0, top: art_top, right: art_w, bottom: h }, ph_br);
             let _ = DeleteObject(ph_br);
         }
     }
@@ -1097,9 +1224,10 @@ unsafe fn apply_settings(hwnd_main: HWND, state: &AppState) {
     let _ = DeleteObject(HFONT(old_font as *mut _));
     let _ = DeleteObject(HFONT(old_font_btn as *mut _));
 
-    // Art cache must be invalidated: decoded bitmap size depends on bar_h
+    // Art cache must be invalidated: hbmp size depends on bar_h
     if let Some(old) = state.art.lock().unwrap().take() {
-        let _ = DeleteObject(HBITMAP(old.hbmp as *mut _));
+        let _ = DeleteObject(HBITMAP(old.hbmp    as *mut _));
+        let _ = DeleteObject(HBITMAP(old.hbmp_bg as *mut _));
     }
 
     appbar_remove(hwnd_main);
@@ -1641,7 +1769,8 @@ fn main() -> Result<()> {
         if !ptr.is_null() {
             let s = Box::from_raw(ptr);
             if let Some(art) = s.art.lock().unwrap().take() {
-                let _ = DeleteObject(HBITMAP(art.hbmp as *mut _));
+                let _ = DeleteObject(HBITMAP(art.hbmp    as *mut _));
+                let _ = DeleteObject(HBITMAP(art.hbmp_bg as *mut _));
             }
             let _ = DeleteObject(HFONT(s.font.load(Ordering::Relaxed) as *mut _));
             let _ = DeleteObject(HFONT(s.font_btn.load(Ordering::Relaxed) as *mut _));
