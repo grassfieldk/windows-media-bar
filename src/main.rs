@@ -81,7 +81,9 @@ const GEAR_PAD: i32 = 8;  // gap between gear button and right window edge
 // ── messages ──────────────────────────────────────────────────────────────────
 const WM_APPBAR:       u32 = WM_APP + 1;
 const WM_MEDIA_UPDATE: u32 = WM_APP + 2;
+const WM_TRAYICON:     u32 = WM_APP + 3;
 const WM_MOUSE_LEAVE:  u32 = 0x02A3;
+const TRAY_UID:        u32 = 1;
 const REFRESH_MS:      u64 = 1000;
 
 // ── settings window control IDs ───────────────────────────────────────────────
@@ -97,6 +99,17 @@ const SETTINGS_KEY: PCWSTR = w!("Software\\MediaBar");
 // ── types ─────────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Default)]
 enum Hover { #[default] None, Prev, Play, Next, Shuffle, Repeat, Gear }
+
+struct ShrGroupState {
+    hover:           Hover,
+    shuffle_active:  bool,
+    shuffle_enabled: bool,
+    repeat_active:   bool,
+    repeat_enabled:  bool,
+    rep_icon:        &'static str,
+    font:            HFONT,
+    accent:          u32,
+}
 
 #[derive(Clone, Default)]
 struct MediaInfo {
@@ -325,6 +338,38 @@ fn enum_monitors() -> Vec<MonitorInfo> {
     list
 }
 
+unsafe fn tray_icon_add(hwnd: HWND) {
+    let hinstance = GetModuleHandleW(None).unwrap_or_default();
+    let hicon = LoadIconW(hinstance, PCWSTR(std::ptr::with_exposed_provenance(1)))
+        .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default());
+
+    let mut tip = [0u16; 128];
+    let s: Vec<u16> = "MediaBar".encode_utf16().collect();
+    tip[..s.len().min(127)].copy_from_slice(&s[..s.len().min(127)]);
+
+    let nid = NOTIFYICONDATAW {
+        cbSize:          std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd:            hwnd,
+        uID:             TRAY_UID,
+        uFlags:          NIF_ICON | NIF_MESSAGE | NIF_TIP,
+        uCallbackMessage: WM_TRAYICON,
+        hIcon:           hicon,
+        szTip:           tip,
+        ..Default::default()
+    };
+    let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+}
+
+unsafe fn tray_icon_remove(hwnd: HWND) {
+    let nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd:   hwnd,
+        uID:    TRAY_UID,
+        ..Default::default()
+    };
+    let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
 unsafe fn show_context_menu(hwnd: HWND) {
     let registered = is_startup_registered();
     let sp         = STATE_PTR.load(Ordering::Relaxed);
@@ -370,6 +415,8 @@ unsafe fn show_context_menu(hwnd: HWND) {
         pt.x, pt.y, 0, hwnd, None,
     );
     let _ = DestroyMenu(menu);
+    // Required after tray-icon popup so the menu dismisses correctly
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
 
     let cmd_val = cmd.0 as usize;
     if cmd_val >= 100 && cmd_val < 100 + monitors.len() {
@@ -847,12 +894,11 @@ unsafe fn draw_gear_btn(dc: HDC, gx: i32, gy: i32, hovered: bool, font: HFONT) {
     SelectObject(dc, of);
 }
 
-unsafe fn draw_shr_group(
-    dc: HDC, gx: i32, gy: i32, hover: Hover,
-    shuffle_active: bool, shuffle_enabled: bool,
-    repeat_active:  bool, repeat_enabled:  bool,
-    rep_icon: &str, font: HFONT, accent: u32,
-) {
+unsafe fn draw_shr_group(dc: HDC, gx: i32, gy: i32, state: &ShrGroupState) {
+    let ShrGroupState {
+        hover, shuffle_active, shuffle_enabled, repeat_active, repeat_enabled,
+        rep_icon, font, accent,
+    } = *state;
     let total_w = SHR_W * 2;
     let gx2 = gx + total_w;
     let gy2 = gy + BTN_H;
@@ -1103,10 +1149,17 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
         use windows::Media::MediaPlaybackAutoRepeatMode as Mode;
         let rep_icon    = if info.repeat == Some(Mode::Track) { ICON_REPEAT_ONE } else { ICON_REPEAT_ALL };
         let repeat_active = info.repeat.map(|r| r != Mode::None).unwrap_or(false);
-        draw_shr_group(mdc, shr_x, btn_top, hover,
-            info.shuffle,  info.shuffle_enabled,
-            repeat_active, info.repeat_enabled,
-            rep_icon, font_btn, accent);
+        let group_state = ShrGroupState {
+            hover,
+            shuffle_active: info.shuffle,
+            shuffle_enabled: info.shuffle_enabled,
+            repeat_active,
+            repeat_enabled: info.repeat_enabled,
+            rep_icon,
+            font: font_btn,
+            accent,
+        };
+        draw_shr_group(mdc, shr_x, btn_top, &group_state);
     }
 
     // Gear button sits at the far right; everything else is pushed left of it.
@@ -1477,9 +1530,14 @@ unsafe extern "system" fn settings_wndproc(
 // ── window procedure ──────────────────────────────────────────────────────────
 static STATE_PTR: std::sync::atomic::AtomicPtr<AppState> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let sp = STATE_PTR.load(std::sync::atomic::Ordering::Relaxed);
+    if msg == TASKBAR_CREATED.load(Ordering::Relaxed) && msg != 0 {
+        tray_icon_add(hwnd);
+        return LRESULT(0);
+    }
     match msg {
         WM_PAINT => {
             if !sp.is_null() { on_paint(hwnd, &*sp); }
@@ -1594,12 +1652,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             show_context_menu(hwnd);
             LRESULT(0)
         }
+        WM_TRAYICON => {
+            match lp.0 as u32 {
+                // Right-click or context-menu key → show menu
+                w if w == WM_RBUTTONUP || w == WM_CONTEXTMENU => {
+                    show_context_menu(hwnd);
+                }
+                // Double-click → open settings
+                w if w == WM_LBUTTONDBLCLK => {
+                    if !sp.is_null() { open_settings(hwnd, sp); }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
         WM_TIMER => {
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, 1);
+            tray_icon_remove(hwnd);
             appbar_remove(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
@@ -1631,6 +1704,7 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         RegisterClassExW(&wc);
+        TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
 
         // Register settings window class
         let sc = WNDCLASSEXW {
@@ -1668,6 +1742,8 @@ fn main() -> Result<()> {
             mon_rect.right - mon_rect.left, bar_h,
             None, None, hinstance, None,
         )?;
+
+        tray_icon_add(hwnd);
 
         let rc = appbar_register(hwnd, mon_rect, bar_h);
         SetWindowPos(
