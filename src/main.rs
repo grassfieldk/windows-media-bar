@@ -134,7 +134,7 @@ struct MediaInfo {
 }
 
 struct CachedArt {
-    key:     String,
+    bytes:   Arc<Vec<u8>>,
     hbmp:    isize, // small (art_w×art_w) — left thumbnail
     hbmp_bg: isize, // large (BG_ART_SIZE×BG_ART_SIZE) — blurred background
 }
@@ -470,13 +470,23 @@ fn get_thumbnail_bytes(thumb_ref: &IRandomAccessStreamReference) -> Option<Arc<V
     if size == 0 { return None; }
     let input: IInputStream = stream.cast().ok()?;
     let reader = DataReader::CreateDataReader(&input).ok()?;
-    reader.LoadAsync(size).ok()?.get().ok()?;
+    if reader.LoadAsync(size).ok()?.get().ok()? != size { return None; }
     let mut bytes = vec![0u8; size as usize];
     reader.ReadBytes(&mut bytes).ok()?;
     Some(Arc::new(bytes))
 }
 
-fn fetch_media_info(prev_title: &str, prev_thumb: Option<Arc<Vec<u8>>>) -> Option<MediaInfo> {
+fn refresh_thumbnail(previous: Option<Arc<Vec<u8>>>, fetched: Option<Arc<Vec<u8>>>) -> Option<Arc<Vec<u8>>> {
+    let fetched = fetched?;
+    if let Some(previous) = previous {
+        if previous.as_slice() == fetched.as_slice() {
+            return Some(previous);
+        }
+    }
+    Some(fetched)
+}
+
+fn fetch_media_info(prev_thumb: Option<Arc<Vec<u8>>>) -> Option<MediaInfo> {
     let mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
         .ok()?.get().ok()?;
     let s = mgr.GetCurrentSession().ok()?;
@@ -494,11 +504,8 @@ fn fetch_media_info(prev_title: &str, prev_thumb: Option<Arc<Vec<u8>>>) -> Optio
     let repeat  = pb.AutoRepeatMode().ok().and_then(|r| r.Value().ok());
 
     let title = p.Title().ok().map(|s| s.to_string()).unwrap_or_default();
-    let thumbnail = if title == prev_title {
-        prev_thumb
-    } else {
-        p.Thumbnail().ok().and_then(|r| get_thumbnail_bytes(&r))
-    };
+    let thumbnail = refresh_thumbnail(prev_thumb,
+        p.Thumbnail().ok().and_then(|r| get_thumbnail_bytes(&r)));
     let (position_100ns, duration_100ns) = (|| -> Option<(i64, i64)> {
         let tl = s.GetTimelineProperties().ok()?;
         let pos   = tl.Position().ok()?.Duration;
@@ -561,7 +568,7 @@ fn send_cmd(cmd: &str, hwnd_raw: isize) {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let ptr = Arc::as_ptr(&state);
         if !STATE_PTR.load(Ordering::Relaxed).is_null() {
-            if let Some(info) = fetch_media_info("", None) {
+            if let Some(info) = fetch_media_info(None) {
                 (*ptr).last_smtc_pos.store(info.position_100ns, Ordering::Relaxed);
                 (*ptr).effective_pos.store(info.position_100ns, Ordering::Relaxed);
                 *(*ptr).pos_sampled.lock().unwrap() = std::time::Instant::now();
@@ -595,11 +602,11 @@ fn seek_to(pos_100ns: i64, hwnd_raw: isize) {
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
         if !STATE_PTR.load(Ordering::Relaxed).is_null() {
-            let (pt, pth) = {
+            let previous_thumbnail = {
                 let info = (*ptr).info.lock().unwrap();
-                (info.title.clone(), info.thumbnail.clone())
+                info.thumbnail.clone()
             };
-            if let Some(info) = fetch_media_info(&pt, pth) {
+            if let Some(info) = fetch_media_info(previous_thumbnail) {
                 (*ptr).last_smtc_pos.store(info.position_100ns, Ordering::Relaxed);
                 (*ptr).effective_pos.store(info.position_100ns, Ordering::Relaxed);
                 *(*ptr).pos_sampled.lock().unwrap() = std::time::Instant::now();
@@ -1070,18 +1077,22 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
     let art_h   = h - ACCENT_H;
     {
         let mut cache = state.art.lock().unwrap();
-        if cache.as_ref().map(|c| c.key.as_str()) != Some(info.title.as_str()) {
+        let unchanged = match (cache.as_ref(), info.thumbnail.as_ref()) {
+            (Some(cached), Some(bytes)) => Arc::ptr_eq(&cached.bytes, bytes),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
             if let Some(old) = cache.take() {
                 let _ = DeleteObject(HBITMAP(old.hbmp    as *mut _));
                 let _ = DeleteObject(HBITMAP(old.hbmp_bg as *mut _));
             }
-            if !info.title.is_empty() {
-                if let Some(ref bytes) = info.thumbnail {
-                    if let (Some(hbmp), Some(hbmp_bg)) = (
-                        decode_thumbnail(bytes, art_w),
-                        decode_thumbnail(bytes, BG_ART_SIZE),
-                    ) {
-                        *cache = Some(CachedArt { key: info.title.clone(), hbmp, hbmp_bg });
+            if let Some(ref bytes) = info.thumbnail {
+                if let Some(hbmp) = decode_thumbnail(bytes, art_w) {
+                    if let Some(hbmp_bg) = decode_thumbnail(bytes, BG_ART_SIZE) {
+                        *cache = Some(CachedArt { bytes: bytes.clone(), hbmp, hbmp_bg });
+                    } else {
+                        let _ = DeleteObject(HBITMAP(hbmp as *mut _));
                     }
                 }
             }
@@ -1944,7 +1955,7 @@ fn main() -> Result<()> {
                     let info = media_state.info.lock().unwrap();
                     (info.title.clone(), info.thumbnail.clone())
                 };
-                let fetched = fetch_media_info(&prev_title, prev_thumb);
+                let fetched = fetch_media_info(prev_thumb);
                 let ptr = Arc::as_ptr(&media_state);
                 if STATE_PTR.load(Ordering::Relaxed).is_null() { break; }
                 if let Some(ref ni) = fetched {
@@ -2019,4 +2030,33 @@ fn main() -> Result<()> {
         CoUninitialize();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod artwork_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_artwork_is_picked_up_after_an_empty_refresh() {
+        let missing = refresh_thumbnail(None, None);
+        let fetched = Arc::new(vec![1, 2, 3]);
+        let loaded = refresh_thumbnail(missing, Some(fetched.clone())).unwrap();
+        assert!(Arc::ptr_eq(&loaded, &fetched));
+    }
+
+    #[test]
+    fn artwork_changes_even_when_the_image_size_is_unchanged() {
+        let previous = Arc::new(vec![1, 2, 3]);
+        let fetched = Arc::new(vec![4, 5, 6]);
+        let refreshed = refresh_thumbnail(Some(previous.clone()), Some(fetched.clone())).unwrap();
+        assert!(!Arc::ptr_eq(&previous, &refreshed));
+        assert!(Arc::ptr_eq(&fetched, &refreshed));
+    }
+
+    #[test]
+    fn unchanged_artwork_reuses_the_decoded_image_key() {
+        let previous = Arc::new(vec![1, 2, 3]);
+        let refreshed = refresh_thumbnail(Some(previous.clone()), Some(Arc::new(vec![1, 2, 3]))).unwrap();
+        assert!(Arc::ptr_eq(&previous, &refreshed));
+    }
 }

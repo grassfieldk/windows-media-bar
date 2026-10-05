@@ -1,6 +1,6 @@
 [package]
 name = "windows-media-bar"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "A lightweight Windows media control bar that docks to the bottom of your screen"
 repository = "https://github.com/grassfieldk/windows-media-bar"
