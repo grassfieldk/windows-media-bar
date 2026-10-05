@@ -1,6 +1,6 @@
 [package]
 name = "windows-media-bar"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "A lightweight Windows media control bar that docks to the bottom of your screen"
 repository = "https://github.com/grassfieldk/windows-media-bar"
@@ -18,9 +18,15 @@ tiny-skia  = "0.11"
 ico        = "0.3"
 
 [dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
@@ -31,6 +37,7 @@ windows = { version = "0.58", features = [
     "Foundation_Collections",
     "UI_ViewManagement",
     "Win32_System_Registry",
+    "Win32_System_Threading",
     "Win32_Graphics_Imaging",
     "Storage_Streams",
 ] }

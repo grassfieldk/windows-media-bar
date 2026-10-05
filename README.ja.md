@@ -12,28 +12,58 @@
 - **シークバー** — クリック・ドラッグでシーク可能、経過時間 / 総時間を表示
 - **システムアクセントカラー対応** — バー上端 1 px のラインが Windows のアクセントカラーに追従
 - **設定画面** (右端の ⚙ ボタン) — バーの高さ・フォント・フォントサイズを変更可能。設定はレジストリに保存される
-- **自動起動** — `HKCU\...\Run` に登録され、Windows 起動時に自動で立ち上がる
+- **自動起動** — インストール時またはタスクトレイのメニューで有効にすると、Windows 起動時に自動で立ち上がる
 
 ## 動作環境
 
 - Windows 10 バージョン 1809 以降（Windows 11 推奨）
 - x86-64 プロセッサ
+
+## インストール
+
+[Releases](https://github.com/grassfieldk/windows-media-bar/releases) から `windows-media-bar-v<バージョン>-x86_64-setup.exe` をダウンロードして実行します。管理者権限は不要です。スタートメニューから起動でき、自動起動はインストール時またはタスクトレイのメニューから設定できます。
+
+Windows の「インストールされているアプリ」からアンインストールすると、自動起動の登録も削除されます。アプリの設定は保持されます。
+
+## アップデート
+
+起動時に GitHub Releases の最新版を確認します。自動更新は初期状態では無効で、インストール時または設定画面の「起動時に自動更新する」で選択できます。
+
+有効の場合は、新しいバージョンをダウンロードして適用し、アプリを再起動します。無効の場合は、バーに表示される「更新」ボタンを押すと更新して再起動します。設定画面から更新を再確認できます。
+
+ダウンロードしたファイルを検証してから更新します。更新後も設定と自動起動の状態は引き継がれます。接続や更新に失敗した場合は、アプリ内のボタンから再試行できます。
+
+## ビルド環境
+
 - [Rust](https://rustup.rs/) stable ツールチェーン（**MSVC** ターゲット: `x86_64-pc-windows-msvc`）
 - Visual Studio Build Tools（C++ デスクトップ開発ワークロード）または Visual Studio
 
 ## ビルド方法
 
 ```powershell
-cargo build --release
+# mise をシェルで有効にしてから実行
+mise activate pwsh | Out-String | Invoke-Expression
+mise install
+mise run build
 ```
 
 ビルド後のバイナリは以下に出力されます。
 
 ```
-target\release\windows-media-bar.exe
+target\x86_64-pc-windows-msvc\release\windows-media-bar.exe
 ```
 
-実行ファイルを一度起動すると自動起動が登録されます。インストーラーは不要です。
+## インストーラの作成
+
+[Inno Setup 6](https://jrsoftware.org/isdl.php) を導入し、mise を有効にしたシェルで実行します。
+
+```powershell
+mise run installer
+# ISCC.exe が標準の場所にない場合
+powershell -NoProfile -File scripts/package-installer.ps1 -CompilerPath 'C:\Tools\Inno Setup 6\ISCC.exe'
+```
+
+`target\installer\windows-media-bar-v<バージョン>-x86_64-setup.exe` と、ファイル検証用の `.sha256` が生成されます。バージョンは `Cargo.toml` から取得します。`Cargo.toml` のバージョンと一致する `v1.2.3` 形式のタグによるリリース、または Release ワークフローの手動実行でもインストーラが生成され、GitHub Releases に添付されます。
 
 ## 設定
 

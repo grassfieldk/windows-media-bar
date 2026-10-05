@@ -1,0 +1,11 @@
+[tools]
+rust = "1.98.1"
+
+[tasks.build]
+description = "Build the Windows release executable"
+run = "cargo build --locked --release --target x86_64-pc-windows-msvc"
+
+[tasks.installer]
+description = "Build the Windows installer using Inno Setup 6"
+depends = ["build"]
+run = "powershell -NoProfile -File scripts/package-installer.ps1"

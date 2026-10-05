@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod updater;
+
 use std::sync::{
     Arc,
     atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering},
@@ -17,6 +19,7 @@ use windows::{
     Win32::System::LibraryLoader::GetModuleHandleW,
     Win32::System::Registry::*,
     Win32::UI::Input::KeyboardAndMouse::*,
+    Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED},
     Win32::UI::Shell::*,
     Win32::UI::WindowsAndMessaging::*,
 };
@@ -90,6 +93,11 @@ const REFRESH_MS:      u64 = 1000;
 const IDC_BARH_EDIT:     i32 = 101;
 const IDC_FONT_COMBO:    i32 = 102;
 const IDC_FONTSIZE_EDIT: i32 = 103;
+const IDC_UPDATE:        i32 = 104;
+const IDC_AUTO_UPDATE:   i32 = 105;
+const IDC_UPDATE_STATUS: i32 = 106;
+const UPDATE_W:          i32 = 112;
+const UPDATE_GAP:        i32 = 8;
 
 // ── registry keys ─────────────────────────────────────────────────────────────
 const STARTUP_KEY:  PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -143,6 +151,7 @@ struct Settings {
     font_face:   String,
     font_size:   i32,
     monitor_idx: u32,
+    auto_update: bool,
 }
 
 impl Default for Settings {
@@ -152,6 +161,7 @@ impl Default for Settings {
             font_face:   DEFAULT_FONT_FACE.to_string(),
             font_size:   DEFAULT_FONT_SIZE,
             monitor_idx: 0,
+            auto_update: false,
         }
     }
 }
@@ -168,6 +178,7 @@ struct AppState {
     font:          AtomicUsize,
     font_btn:      AtomicUsize,
     settings:      Mutex<Settings>,
+    updater:       updater::Updater,
 }
 
 struct SettingsCtx {
@@ -238,6 +249,15 @@ fn load_settings() -> Settings {
             s.monitor_idx = val;
         }
 
+        let mut val = 0u32;
+        let mut sz = 4u32;
+        if RegQueryValueExW(key, w!("AutoUpdate"), None, Some(&mut ty),
+            Some(&mut val as *mut u32 as *mut u8), Some(&mut sz)) == ERROR_SUCCESS
+            && ty == REG_DWORD
+        {
+            s.auto_update = val != 0;
+        }
+
         let _ = RegCloseKey(key);
     }
     s
@@ -264,6 +284,10 @@ fn save_settings(s: &Settings) {
 
         let v = s.monitor_idx;
         let _ = RegSetValueExW(key, w!("MonitorIdx"), 0, REG_DWORD,
+            Some(std::slice::from_raw_parts(&v as *const u32 as *const u8, 4)));
+
+        let v = u32::from(s.auto_update);
+        let _ = RegSetValueExW(key, w!("AutoUpdate"), 0, REG_DWORD,
             Some(std::slice::from_raw_parts(&v as *const u32 as *const u8, 4)));
 
         let _ = RegCloseKey(key);
@@ -500,6 +524,7 @@ fn fetch_media_info(prev_title: &str, prev_thumb: Option<Arc<Vec<u8>>>) -> Optio
 }
 
 fn send_cmd(cmd: &str, hwnd_raw: isize) {
+    let Some(state) = app_state_snapshot() else { return; };
     let cmd = cmd.to_string();
     std::thread::spawn(move || unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -534,8 +559,8 @@ fn send_cmd(cmd: &str, hwnd_raw: isize) {
             Some(())
         })();
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let ptr = STATE_PTR.load(Ordering::Relaxed);
-        if !ptr.is_null() {
+        let ptr = Arc::as_ptr(&state);
+        if !STATE_PTR.load(Ordering::Relaxed).is_null() {
             if let Some(info) = fetch_media_info("", None) {
                 (*ptr).last_smtc_pos.store(info.position_100ns, Ordering::Relaxed);
                 (*ptr).effective_pos.store(info.position_100ns, Ordering::Relaxed);
@@ -552,6 +577,7 @@ fn send_cmd(cmd: &str, hwnd_raw: isize) {
 }
 
 fn seek_to(pos_100ns: i64, hwnd_raw: isize) {
+    let Some(state) = app_state_snapshot() else { return; };
     std::thread::spawn(move || unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let _ = (|| -> Option<()> {
@@ -561,15 +587,14 @@ fn seek_to(pos_100ns: i64, hwnd_raw: isize) {
             let _ = s.TryChangePlaybackPositionAsync(pos_100ns).and_then(|a| a.get());
             Some(())
         })();
-        let ptr = STATE_PTR.load(Ordering::Relaxed);
-        if !ptr.is_null() {
+        let ptr = Arc::as_ptr(&state);
+        if !STATE_PTR.load(Ordering::Relaxed).is_null() {
             (*ptr).last_smtc_pos.store(pos_100ns, Ordering::Relaxed);
             (*ptr).effective_pos.store(pos_100ns, Ordering::Relaxed);
             *(*ptr).pos_sampled.lock().unwrap() = std::time::Instant::now();
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let ptr = STATE_PTR.load(Ordering::Relaxed);
-        if !ptr.is_null() {
+        if !STATE_PTR.load(Ordering::Relaxed).is_null() {
             let (pt, pth) = {
                 let info = (*ptr).info.lock().unwrap();
                 (info.title.clone(), info.thumbnail.clone())
@@ -862,21 +887,26 @@ unsafe fn draw_btn_group(
 }
 
 unsafe fn draw_gear_btn(dc: HDC, gx: i32, gy: i32, hovered: bool, font: HFONT) {
-    let gx2 = gx + GEAR_W;
+    draw_bar_button(dc, gx, gy, GEAR_W, ICON_GEAR, hovered, false, font);
+}
+
+unsafe fn draw_bar_button(dc: HDC, gx: i32, gy: i32, width: i32, text: &str,
+                         highlighted: bool, disabled: bool, font: HFONT) {
+    let gx2 = gx + width;
     let gy2 = gy + BTN_H;
 
     // Background — clipped to rounded rect
     let saved = SaveDC(dc);
     let rgn   = CreateRoundRectRgn(gx, gy, gx2 + 1, gy2 + 1, CORNER, CORNER);
     SelectClipRgn(dc, rgn);
-    let bg_br = CreateSolidBrush(COLORREF(if hovered { C_BTN_HOV } else { C_BTN }));
+    let bg_br = CreateSolidBrush(COLORREF(if highlighted { C_BTN_HOV } else { C_BTN }));
     FillRect(dc, &RECT { left: gx, top: gy, right: gx2, bottom: gy2 }, bg_br);
     let _ = DeleteObject(bg_br);
     let _ = RestoreDC(dc, saved);
     let _ = DeleteObject(rgn);
 
     // Border
-    let pn = CreatePen(PS_SOLID, 1, COLORREF(if hovered { C_BTN_BDR_H } else { C_BTN_BDR }));
+    let pn = CreatePen(PS_SOLID, 1, COLORREF(if highlighted { C_BTN_BDR_H } else { C_BTN_BDR }));
     let op = SelectObject(dc, pn);
     let ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
     let _ = RoundRect(dc, gx, gy, gx2, gy2, CORNER, CORNER);
@@ -884,11 +914,11 @@ unsafe fn draw_gear_btn(dc: HDC, gx: i32, gy: i32, hovered: bool, font: HFONT) {
     SelectObject(dc, ob);
     let _ = DeleteObject(pn);
 
-    // Gear icon
+    // Button content
     let of = SelectObject(dc, font);
-    SetTextColor(dc, COLORREF(C_ICON));
+    SetTextColor(dc, COLORREF(if disabled { C_ARTIST } else { C_ICON }));
     SetBkMode(dc, TRANSPARENT);
-    let mut wide = w16(ICON_GEAR);
+    let mut wide = w16(text);
     let mut r = RECT { left: gx, top: gy, right: gx2, bottom: gy2 };
     DrawTextW(dc, &mut wide, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, of);
@@ -1164,17 +1194,18 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
 
     // Gear button sits at the far right; everything else is pushed left of it.
     let gear_x   = w - GEAR_PAD - GEAR_W;
+    let content_right = media_right(state, gear_x);
     let has_seek = info.duration_100ns > 0;
     let text_max_x = if has_seek {
-        gear_x - SEEK_PAD_R - SEEK_W - TIME_GAP - TIME_W - TIME_GAP
+        content_right - SEEK_PAD_R - SEEK_W - TIME_GAP - TIME_W - TIME_GAP
     } else {
-        gear_x
+        content_right
     };
     let font = HFONT(state.font.load(Ordering::Relaxed) as *mut _);
     draw_media_text(mdc, &info, font, text_x, text_max_x, h);
 
     if has_seek {
-        let sx      = gear_x - SEEK_PAD_R - SEEK_W;
+        let sx      = content_right - SEEK_PAD_R - SEEK_W;
         let seek_cy = ACCENT_H + (h - ACCENT_H) / 2;
         let sy      = seek_cy - SEEK_H / 2;
 
@@ -1259,6 +1290,57 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
 }
 
 // ── settings window ───────────────────────────────────────────────────────────
+fn media_right(state: &AppState, gear_x: i32) -> i32 {
+    if state.updater.status().bar_button_text().is_some() {
+        gear_x - UPDATE_W - UPDATE_GAP
+    } else {
+        gear_x
+    }
+}
+
+unsafe fn refresh_update_ui(hwnd: HWND, state: &AppState) {
+    let status = state.updater.status();
+    if let Ok(button) = GetDlgItem(hwnd, IDC_UPDATE) {
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        let x = rc.right - GEAR_PAD - GEAR_W - UPDATE_W - UPDATE_GAP;
+        let y = ACCENT_H + (rc.bottom - ACCENT_H - BTN_H) / 2;
+        let _ = SetWindowPos(button, None, x.max(0), y, UPDATE_W.min(rc.right.max(0)), BTN_H, SWP_NOZORDER | SWP_NOACTIVATE);
+        if let Some(text) = status.bar_button_text() {
+            let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+            let _ = SetWindowTextW(button, PCWSTR(wide.as_ptr()));
+            let _ = EnableWindow(button, matches!(status, updater::Status::Available(_) | updater::Status::Failed(_)));
+            let _ = ShowWindow(button, SW_SHOWNOACTIVATE);
+        } else {
+            let _ = ShowWindow(button, SW_HIDE);
+        }
+        let _ = InvalidateRect(button, None, false);
+    }
+    let settings = SETTINGS_HWND.load(Ordering::Relaxed);
+    if settings != 0 {
+        let settings = HWND(settings as *mut _);
+        if let Ok(label) = GetDlgItem(settings, IDC_UPDATE_STATUS) {
+            let wide: Vec<u16> = status.description().encode_utf16().chain([0]).collect();
+            let _ = SetWindowTextW(label, PCWSTR(wide.as_ptr()));
+        }
+        if let Ok(button) = GetDlgItem(settings, IDC_UPDATE) {
+            let text = status.button_text().unwrap_or("更新を確認");
+            let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+            let _ = SetWindowTextW(button, PCWSTR(wide.as_ptr()));
+            let _ = EnableWindow(button, !matches!(status, updater::Status::Checking | updater::Status::Downloading | updater::Status::Ready(_)));
+        }
+    }
+    let _ = InvalidateRect(hwnd, None, false);
+}
+
+fn request_update(state: &AppState, hwnd: HWND) {
+    match state.updater.status() {
+        updater::Status::Available(_) | updater::Status::CheckFailed(_) | updater::Status::Failed(_) => state.updater.download(hwnd.0 as isize),
+        updater::Status::Current => state.updater.check(hwnd.0 as isize),
+        _ => {}
+    }
+}
+
 static SETTINGS_HWND: std::sync::atomic::AtomicIsize =
     std::sync::atomic::AtomicIsize::new(0);
 
@@ -1318,7 +1400,7 @@ unsafe fn open_settings(hwnd_main: HWND, state_ptr: *mut AppState) {
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let ww = 376;
-    let wh = 204;
+    let wh = 346;
     match CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW,
         w!("MediaBarSettings"),
@@ -1329,6 +1411,7 @@ unsafe fn open_settings(hwnd_main: HWND, state_ptr: *mut AppState) {
     ) {
         Ok(hw) => {
             SETTINGS_HWND.store(hw.0 as isize, Ordering::Relaxed);
+            refresh_update_ui(hwnd_main, &*state_ptr);
             let _ = ShowWindow(hw, SW_SHOW);
         }
         Err(_) => { let _ = Box::from_raw(ctx); }
@@ -1365,9 +1448,9 @@ unsafe extern "system" fn settings_wndproc(
 
             let hi: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
             let state = &*(*ctx).state_ptr;
-            let (bar_h, font_face, font_size) = {
+            let (bar_h, font_face, font_size, auto_update) = {
                 let s = state.settings.lock().unwrap();
-                (s.bar_h, s.font_face.clone(), s.font_size)
+                (s.bar_h, s.font_face.clone(), s.font_size, s.auto_update)
             };
 
             let gui_font = GetStockObject(DEFAULT_GUI_FONT);
@@ -1387,10 +1470,10 @@ unsafe extern "system" fn settings_wndproc(
             };
 
             // ── layout ────────────────────────────────────────────────────────
-            // Client area: ~356 × 162 px
+            // Client area: ~356 by 304 px
             // Columns:  label x=20 w=112 | control x=140 w=196
             // Rows:     y=20 (barh), y=55 (font), y=91 (size)
-            // Buttons:  y=129, right-aligned to x=336
+            // Buttons:  y=269, right-aligned to x=336
             let (lx, cx, cw, rh) = (20i32, 140i32, 196i32, 22i32);
 
             mk(0, w!("STATIC"), w!("バーの高さ"),    0, lx, 22, 112, rh, 0);
@@ -1410,7 +1493,18 @@ unsafe extern "system" fn settings_wndproc(
                 0x0003 | WS_TABSTOP.0, cx, 55, cw, 200, IDC_FONT_COMBO);
 
             // Buttons — right-aligned, OK on the far right
-            let (bw, by, bh) = (72i32, 129i32, 26i32);
+            let automatic = mk(0, w!("BUTTON"), w!("起動時に自動更新する"),
+                WS_TABSTOP.0 | 0x0003, lx, 128, 316, 24, IDC_AUTO_UPDATE);
+            SendMessageW(automatic, 0x00F1 /*BM_SETCHECK*/, WPARAM(usize::from(auto_update)), LPARAM(0));
+            mk(0, w!("STATIC"), w!("無効の場合はバーの更新ボタンから更新できます"),
+                0, lx, 156, 316, 22, 0);
+            let version = format!("現在のバージョン: {}", env!("CARGO_PKG_VERSION"));
+            let wide: Vec<u16> = version.encode_utf16().chain([0]).collect();
+            mk(0, w!("STATIC"), PCWSTR(wide.as_ptr()), 0, lx, 184, 196, 22, 0);
+            mk(0, w!("BUTTON"), w!("更新を確認"), WS_TABSTOP.0, 224, 180, 112, 26, IDC_UPDATE);
+            mk(0, w!("STATIC"), w!(""), 0, lx, 214, 316, 46, IDC_UPDATE_STATUS);
+
+            let (bw, by, bh) = (72i32, 269i32, 26i32);
             let br = cx + cw; // right edge = 336
             mk(0, w!("BUTTON"), w!("OK"),         WS_TABSTOP.0 | 1, br - bw,      by, bw, bh, 1);
             mk(0, w!("BUTTON"), w!("キャンセル"), WS_TABSTOP.0,     br - bw*2 - 8, by, bw, bh, 2);
@@ -1499,6 +1593,9 @@ unsafe extern "system" fn settings_wndproc(
                         s.bar_h     = bar_h;
                         s.font_face = font_face;
                         s.font_size = font_size;
+                        if let Ok(checkbox) = GetDlgItem(hwnd, IDC_AUTO_UPDATE) {
+                            s.auto_update = SendMessageW(checkbox, 0x00F0 /*BM_GETCHECK*/, WPARAM(0), LPARAM(0)).0 == 1;
+                        }
                         save_settings(&s);
                     }
 
@@ -1509,6 +1606,7 @@ unsafe extern "system" fn settings_wndproc(
                     let _ = DestroyWindow(hwnd);
                 }
                 2 => { let _ = DestroyWindow(hwnd); } // IDCANCEL
+                IDC_UPDATE => request_update(&*(*ctx).state_ptr, HWND((*ctx).hwnd_main as *mut _)),
                 _ => {}
             }
             LRESULT(0)
@@ -1532,6 +1630,16 @@ static STATE_PTR: std::sync::atomic::AtomicPtr<AppState> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
+// Called on the window thread before starting background media operations
+fn app_state_snapshot() -> Option<Arc<AppState>> {
+    let ptr = STATE_PTR.load(Ordering::Relaxed);
+    if ptr.is_null() { return None; }
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Some(Arc::from_raw(ptr))
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let sp = STATE_PTR.load(std::sync::atomic::Ordering::Relaxed);
     if msg == TASKBAR_CREATED.load(Ordering::Relaxed) && msg != 0 {
@@ -1547,6 +1655,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
+        updater::MESSAGE => {
+            if !sp.is_null() {
+                let state = &*sp;
+                match state.updater.status() {
+                    status if status.should_auto_update(state.settings.lock().unwrap().auto_update) => {
+                        state.updater.download(hwnd.0 as isize);
+                    }
+                    updater::Status::Ready(path) => {
+                        match updater::launch_helper(&path) {
+                            Ok(()) => { let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)); }
+                            Err(error) => state.updater.fail(error),
+                        }
+                    }
+                    _ => {}
+                }
+                refresh_update_ui(hwnd, state);
+            }
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            if !sp.is_null() { refresh_update_ui(hwnd, &*sp); }
+            LRESULT(0)
+        }
+        WM_COMMAND if (wp.0 & 0xFFFF) as i32 == IDC_UPDATE => {
+            if !sp.is_null() { request_update(&*sp, hwnd); }
+            LRESULT(0)
+        }
+        WM_DRAWITEM if wp.0 == IDC_UPDATE as usize && !sp.is_null() => {
+            let item = &*(lp.0 as *const DRAWITEMSTRUCT);
+            let background = CreateSolidBrush(COLORREF(C_BG));
+            FillRect(item.hDC, &item.rcItem, background);
+            let _ = DeleteObject(background);
+            let text = (*sp).updater.status().bar_button_text().unwrap_or("");
+            draw_bar_button(item.hDC, item.rcItem.left, item.rcItem.top,
+                item.rcItem.right - item.rcItem.left, text,
+                item.itemState.0 & (ODS_SELECTED.0 | ODS_FOCUS.0) != 0,
+                item.itemState.0 & ODS_DISABLED.0 != 0, HFONT(GetStockObject(DEFAULT_GUI_FONT).0));
+            LRESULT(1)
+        }
         WM_MOUSEMOVE => {
             if !sp.is_null() {
                 let x = (lp.0 & 0xFFFF) as i16 as i32;
@@ -1560,7 +1707,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let dragging = {
                     let mut drag = (*sp).seeking.lock().unwrap();
                     if drag.is_some() {
-                        let sx = gear_x - SEEK_PAD_R - SEEK_W;
+                        let sx = media_right(&*sp, gear_x) - SEEK_PAD_R - SEEK_W;
                         *drag = Some(((x - sx) as f64 / SEEK_W as f64).clamp(0.0, 1.0));
                         true
                     } else {
@@ -1615,7 +1762,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
             let gear_x  = rc.right - GEAR_PAD - GEAR_W;
-            let sx      = gear_x - SEEK_PAD_R - SEEK_W;
+            let sx      = if sp.is_null() { gear_x } else { media_right(&*sp, gear_x) } - SEEK_PAD_R - SEEK_W;
             let group_x = rc.bottom + SIDE_PAD;
             let shr_x   = group_x + GROUP_W + SHR_GAP;
             let rep_x   = shr_x + SHR_W;
@@ -1683,6 +1830,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 // ── entry point ───────────────────────────────────────────────────────────────
 fn main() -> Result<()> {
+    if updater::run_helper_if_requested() { return Ok(()); }
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
@@ -1737,7 +1885,7 @@ fn main() -> Result<()> {
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("MediaBarClass"),
             w!("MediaBar"),
-            WS_POPUP | WS_VISIBLE,
+            WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
             mon_rect.left, mon_rect.bottom - bar_h,
             mon_rect.right - mon_rect.left, bar_h,
             None, None, hinstance, None,
@@ -1757,7 +1905,7 @@ fn main() -> Result<()> {
         let font     = make_font(PCWSTR(face_wide.as_ptr()), settings.font_size);
         let font_btn = make_font(w!("Segoe MDL2 Assets"), 14);
 
-        let state = Box::new(AppState {
+        let state = Arc::new(AppState {
             info:          Mutex::new(MediaInfo::default()),
             hover:         Mutex::new(Hover::None),
             accent:        AtomicU32::new(get_accent_color()),
@@ -1769,20 +1917,36 @@ fn main() -> Result<()> {
             font:          AtomicUsize::new(font.0 as usize),
             font_btn:      AtomicUsize::new(font_btn.0 as usize),
             settings:      Mutex::new(settings),
+            updater:       updater::Updater::new(),
         });
-        STATE_PTR.store(Box::into_raw(state), std::sync::atomic::Ordering::Relaxed);
+        let media_state = state.clone();
+        STATE_PTR.store(Arc::into_raw(state) as *mut AppState, std::sync::atomic::Ordering::Relaxed);
+
+        let update_button = CreateWindowExW(
+            WINDOW_EX_STYLE(0), w!("BUTTON"), w!("更新"), WS_CHILD | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
+            0, 0, UPDATE_W, BTN_H, hwnd, HMENU(IDC_UPDATE as usize as *mut _), hinstance, None,
+        )?;
+        SendMessageW(update_button, WM_SETFONT, WPARAM(GetStockObject(DEFAULT_GUI_FONT).0 as usize), LPARAM(1));
+        let updater = &(*STATE_PTR.load(Ordering::Relaxed)).updater;
+        if let Some(error) = updater::previous_failure() {
+            updater.fail(error);
+        } else {
+            updater.check(hwnd.0 as isize);
+        }
+        refresh_update_ui(hwnd, &*STATE_PTR.load(Ordering::Relaxed));
 
         let hwnd_raw = hwnd.0 as isize;
         std::thread::spawn(move || {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             loop {
+                if STATE_PTR.load(Ordering::Relaxed).is_null() { break; }
                 let (prev_title, prev_thumb) = {
-                    let info = (*STATE_PTR.load(Ordering::Relaxed)).info.lock().unwrap();
+                    let info = media_state.info.lock().unwrap();
                     (info.title.clone(), info.thumbnail.clone())
                 };
                 let fetched = fetch_media_info(&prev_title, prev_thumb);
-                let ptr = STATE_PTR.load(Ordering::Relaxed);
-                if ptr.is_null() { break; }
+                let ptr = Arc::as_ptr(&media_state);
+                if STATE_PTR.load(Ordering::Relaxed).is_null() { break; }
                 if let Some(ref ni) = fetched {
                     if ni.duration_100ns > 0 {
                         let last = (*ptr).last_smtc_pos.load(Ordering::Relaxed);
@@ -1843,7 +2007,7 @@ fn main() -> Result<()> {
 
         let ptr = STATE_PTR.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
         if !ptr.is_null() {
-            let s = Box::from_raw(ptr);
+            let s = Arc::from_raw(ptr);
             if let Some(art) = s.art.lock().unwrap().take() {
                 let _ = DeleteObject(HBITMAP(art.hbmp    as *mut _));
                 let _ = DeleteObject(HBITMAP(art.hbmp_bg as *mut _));

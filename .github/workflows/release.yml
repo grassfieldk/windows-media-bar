@@ -21,12 +21,19 @@ jobs:
 
       - name: Resolve version tag
         id: tag
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            echo "TAG=${{ inputs.version }}" >> $env:GITHUB_ENV
+          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            $tag = $env:REQUESTED_VERSION
           } else {
-            echo "TAG=${{ github.ref_name }}" >> $env:GITHUB_ENV
+            $tag = $env:GITHUB_REF_NAME
           }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Version must have the form v1.2.3" }
+          $manifest = Get-Content Cargo.toml -Raw
+          $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if ($tag -ne "v$version") { throw "Release tag must match Cargo.toml version ($version)" }
+          "TAG=$tag" >> $env:GITHUB_ENV
         shell: pwsh
 
       - name: Install Rust stable (MSVC)
@@ -45,7 +52,11 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build release binary
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Build installer
+        run: ./scripts/package-installer.ps1 -Version $env:TAG
+        shell: pwsh
 
       - name: Rename artifact
         run: |
@@ -59,5 +70,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
-          files: ${{ env.ARTIFACT }}
+          files: |
+            ${{ env.ARTIFACT }}
+            target/installer/windows-media-bar-${{ env.TAG }}-x86_64-setup.exe
+            target/installer/windows-media-bar-${{ env.TAG }}-x86_64-setup.exe.sha256
           generate_release_notes: true
