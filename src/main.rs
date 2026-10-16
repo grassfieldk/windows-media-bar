@@ -119,7 +119,7 @@ struct ShrGroupState {
     accent:          u32,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 struct MediaInfo {
     title:           String,
     artist:          String,
@@ -137,6 +137,20 @@ struct CachedArt {
     bytes:   Arc<Vec<u8>>,
     hbmp:    isize, // small (art_w×art_w) — left thumbnail
     hbmp_bg: isize, // large (BG_ART_SIZE×BG_ART_SIZE) — blurred background
+    art_size: i32,
+    background: Option<(i32, i32, isize)>,
+}
+
+impl Drop for CachedArt {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(HBITMAP(self.hbmp as *mut _));
+            let _ = DeleteObject(HBITMAP(self.hbmp_bg as *mut _));
+            if let Some((_, _, bitmap)) = self.background.take() {
+                let _ = DeleteObject(HBITMAP(bitmap as *mut _));
+            }
+        }
+    }
 }
 
 const BG_ART_SIZE: i32 = 300;
@@ -1058,6 +1072,10 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     let (w, h) = (rc.right, rc.bottom);
+    if w <= 0 || h <= 0 {
+        let _ = EndPaint(hwnd, &ps);
+        return;
+    }
 
     // Layout derived from the actual window height
     let art_w   = h;
@@ -1078,19 +1096,16 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
     {
         let mut cache = state.art.lock().unwrap();
         let unchanged = match (cache.as_ref(), info.thumbnail.as_ref()) {
-            (Some(cached), Some(bytes)) => Arc::ptr_eq(&cached.bytes, bytes),
+            (Some(cached), Some(bytes)) => Arc::ptr_eq(&cached.bytes, bytes) && cached.art_size == art_w,
             (None, None) => true,
             _ => false,
         };
         if !unchanged {
-            if let Some(old) = cache.take() {
-                let _ = DeleteObject(HBITMAP(old.hbmp    as *mut _));
-                let _ = DeleteObject(HBITMAP(old.hbmp_bg as *mut _));
-            }
+            cache.take();
             if let Some(ref bytes) = info.thumbnail {
                 if let Some(hbmp) = decode_thumbnail(bytes, art_w) {
                     if let Some(hbmp_bg) = decode_thumbnail(bytes, BG_ART_SIZE) {
-                        *cache = Some(CachedArt { bytes: bytes.clone(), hbmp, hbmp_bg });
+                        *cache = Some(CachedArt { bytes: bytes.clone(), hbmp, hbmp_bg, art_size: art_w, background: None });
                     } else {
                         let _ = DeleteObject(HBITMAP(hbmp as *mut _));
                     }
@@ -1098,55 +1113,67 @@ unsafe fn on_paint(hwnd: HWND, state: &AppState) {
             }
         }
 
-        if let Some(ref cached) = *cache {
+        if let Some(ref mut cached) = *cache {
             // ── blurred background ────────────────────────────────────────────
-            // 1. StretchBlt the center crop of hbmp_bg into a full-bar-size DIB.
-            // 2. Apply a software separable box blur directly on the pixel data.
-            // This gives a real blur at full resolution — no downscale artefacts.
-            let src_dc = CreateCompatibleDC(mdc);
-            let old_src = SelectObject(src_dc, HBITMAP(cached.hbmp_bg as *mut _));
+            // Rebuild the full-resolution background only when its size changes.
+            if cached.background.as_ref().map(|&(bw, bh, _)| (bw, bh)) != Some((w, h)) {
+                if let Some((_, _, bitmap)) = cached.background.take() {
+                    let _ = DeleteObject(HBITMAP(bitmap as *mut _));
+                }
+                let src_dc = CreateCompatibleDC(mdc);
+                let old_src = SelectObject(src_dc, HBITMAP(cached.hbmp_bg as *mut _));
 
-            let bg_sz   = BG_ART_SIZE;
-            let src_h_f = bg_sz as f64 * h as f64 / w as f64;
-            let src_h_i = (src_h_f.ceil() as i32).max(1).min(bg_sz);
-            let src_y   = ((bg_sz - src_h_i) / 2).max(0);
+                let bg_sz   = BG_ART_SIZE;
+                let src_h_f = bg_sz as f64 * h as f64 / w as f64;
+                let src_h_i = (src_h_f.ceil() as i32).max(1).min(bg_sz);
+                let src_y   = ((bg_sz - src_h_i) / 2).max(0);
 
-            let mut bg_bits: *mut std::ffi::c_void = std::ptr::null_mut();
-            let bg_bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize:        std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth:       w,
-                    biHeight:      -h, // top-down
-                    biPlanes:      1,
-                    biBitCount:    32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                bmiColors: [RGBQUAD::default()],
-            };
-            if let Ok(bg_dib) = CreateDIBSection(
-                HDC(std::ptr::null_mut()), &bg_bmi, DIB_RGB_COLORS, &mut bg_bits, None, 0,
-            ) {
-                let bg_dc  = CreateCompatibleDC(mdc);
-                let old_bg = SelectObject(bg_dc, bg_dib);
-                SetStretchBltMode(bg_dc, HALFTONE);
-                let _ = StretchBlt(bg_dc, 0, 0, w, h,
-                                   src_dc, 0, src_y, bg_sz, src_h_i, SRCCOPY);
+                let mut bg_bits: *mut std::ffi::c_void = std::ptr::null_mut();
+                let bg_bmi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize:        std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth:       w,
+                        biHeight:      -h, // top-down
+                        biPlanes:      1,
+                        biBitCount:    32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    bmiColors: [RGBQUAD::default()],
+                };
+                if let Ok(bg_dib) = CreateDIBSection(
+                    HDC(std::ptr::null_mut()), &bg_bmi, DIB_RGB_COLORS, &mut bg_bits, None, 0,
+                ) {
+                    let bg_dc  = CreateCompatibleDC(mdc);
+                    let old_bg = SelectObject(bg_dc, bg_dib);
+                    SetStretchBltMode(bg_dc, HALFTONE);
+                    let _ = StretchBlt(bg_dc, 0, 0, w, h,
+                                       src_dc, 0, src_y, bg_sz, src_h_i, SRCCOPY);
 
-                // Apply blur directly on the DIB pixel buffer
-                let pixel_count = (w * h * 4) as usize;
-                let pixels = std::slice::from_raw_parts_mut(bg_bits as *mut u8, pixel_count);
-                apply_blur(pixels, w as usize, h as usize, 12);
+                    let _ = GdiFlush();
+                    // Apply blur directly on the DIB pixel buffer
+                    let pixel_count = (w * h * 4) as usize;
+                    let pixels = std::slice::from_raw_parts_mut(bg_bits as *mut u8, pixel_count);
+                    apply_blur(pixels, w as usize, h as usize, 12);
 
-                // Copy blurred result to the back buffer
-                let _ = BitBlt(mdc, 0, 0, w, h, bg_dc, 0, 0, SRCCOPY);
-
-                SelectObject(bg_dc, old_bg);
-                let _ = DeleteDC(bg_dc);
-                let _ = DeleteObject(bg_dib);
+                    SelectObject(bg_dc, old_bg);
+                    let _ = DeleteDC(bg_dc);
+                    cached.background = Some((w, h, bg_dib.0 as isize));
+                }
+                SelectObject(src_dc, old_src);
+                let _ = DeleteDC(src_dc);
             }
-            SelectObject(src_dc, old_src);
-            let _ = DeleteDC(src_dc);
+            let bg_dc = CreateCompatibleDC(mdc);
+            if let Some((_, _, bitmap)) = cached.background {
+                let old_bg = SelectObject(bg_dc, HBITMAP(bitmap as *mut _));
+                let _ = BitBlt(mdc, 0, 0, w, h, bg_dc, 0, 0, SRCCOPY);
+                SelectObject(bg_dc, old_bg);
+            } else {
+                let brush = CreateSolidBrush(COLORREF(C_BG));
+                FillRect(mdc, &rc, brush);
+                let _ = DeleteObject(brush);
+            }
+            let _ = DeleteDC(bg_dc);
 
             // ── dark overlay ──────────────────────────────────────────────────
             let ov_dc  = CreateCompatibleDC(mdc);
@@ -1371,10 +1398,7 @@ unsafe fn apply_settings(hwnd_main: HWND, state: &AppState) {
     let _ = DeleteObject(HFONT(old_font_btn as *mut _));
 
     // Art cache must be invalidated: hbmp size depends on bar_h
-    if let Some(old) = state.art.lock().unwrap().take() {
-        let _ = DeleteObject(HBITMAP(old.hbmp    as *mut _));
-        let _ = DeleteObject(HBITMAP(old.hbmp_bg as *mut _));
-    }
+    state.art.lock().unwrap().take();
 
     appbar_remove(hwnd_main);
     let monitors = enum_monitors();
@@ -1825,7 +1849,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_TIMER => {
-            let _ = InvalidateRect(hwnd, None, false);
+            if !sp.is_null() {
+                let info = (*sp).info.lock().unwrap();
+                if info.playing && info.duration_100ns > 0 {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -1980,11 +2009,19 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                (*ptr).info.lock().unwrap().clone_from(&fetched.unwrap_or_default());
-                let _ = PostMessageW(
-                    HWND(hwnd_raw as *mut _),
-                    WM_MEDIA_UPDATE, WPARAM(0), LPARAM(0),
-                );
+                let next = fetched.unwrap_or_default();
+                let changed = {
+                    let mut info = (*ptr).info.lock().unwrap();
+                    let changed = *info != next;
+                    *info = next;
+                    changed
+                };
+                if changed {
+                    let _ = PostMessageW(
+                        HWND(hwnd_raw as *mut _),
+                        WM_MEDIA_UPDATE, WPARAM(0), LPARAM(0),
+                    );
+                }
                 std::thread::sleep(std::time::Duration::from_millis(REFRESH_MS));
             }
             CoUninitialize();
@@ -2019,10 +2056,7 @@ fn main() -> Result<()> {
         let ptr = STATE_PTR.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
         if !ptr.is_null() {
             let s = Arc::from_raw(ptr);
-            if let Some(art) = s.art.lock().unwrap().take() {
-                let _ = DeleteObject(HBITMAP(art.hbmp    as *mut _));
-                let _ = DeleteObject(HBITMAP(art.hbmp_bg as *mut _));
-            }
+            s.art.lock().unwrap().take();
             let _ = DeleteObject(HFONT(s.font.load(Ordering::Relaxed) as *mut _));
             let _ = DeleteObject(HFONT(s.font_btn.load(Ordering::Relaxed) as *mut _));
         }
