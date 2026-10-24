@@ -4,7 +4,7 @@ mod updater;
 
 use std::sync::{
     Arc,
-    atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering},
     Mutex,
 };
 use windows::{
@@ -181,6 +181,7 @@ impl Default for Settings {
 }
 
 struct AppState {
+    fullscreen:    AtomicBool,
     info:          Mutex<MediaInfo>,
     hover:         Mutex<Hover>,
     accent:        AtomicU32,
@@ -673,6 +674,52 @@ fn appbar_remove(hwnd: HWND) {
             ..Default::default()
         };
         SHAppBarMessage(ABM_REMOVE, &mut d);
+    }
+}
+
+fn covers_monitor(window: RECT, monitor: RECT) -> bool {
+    window.left <= monitor.left && window.top <= monitor.top
+        && window.right >= monitor.right && window.bottom >= monitor.bottom
+}
+
+// Shell notifications cover exclusive fullscreen; bounds also catch borderless windows.
+unsafe fn foreground_fullscreen(hwnd: HWND, shell_opening: bool) -> Option<bool> {
+    let foreground = GetForegroundWindow();
+    if foreground.0.is_null() { return None; }
+    if foreground == hwnd || foreground == GetShellWindow() || IsIconic(foreground).as_bool() {
+        return Some(false);
+    }
+    let mut class = [0u16; 256];
+    let count = GetClassNameW(foreground, &mut class);
+    let class = String::from_utf16_lossy(&class[..count.max(0) as usize]);
+    if class == "Progman" || class == "WorkerW" || class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd" {
+        return Some(false);
+    }
+    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !GetMonitorInfoW(monitor, &mut info).as_bool() { return None; }
+    let mut rect = RECT::default();
+    if GetWindowRect(foreground, &mut rect).is_err() { return None; }
+    Some(covers_monitor(rect, info.rcMonitor)
+        || (shell_opening && MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) == monitor))
+}
+
+unsafe fn refresh_fullscreen_state(hwnd: HWND, state: &AppState, shell_opening: bool) {
+    let Some(fullscreen) = foreground_fullscreen(hwnd, shell_opening) else { return; };
+    if state.fullscreen.swap(fullscreen, Ordering::Relaxed) == fullscreen { return; }
+    if fullscreen {
+        *state.hover.lock().unwrap() = Hover::None;
+        if state.seeking.lock().unwrap().take().is_some() {
+            let _ = ReleaseCapture();
+        }
+    }
+    let _ = SetWindowPos(
+        hwnd, if fullscreen { HWND_BOTTOM } else { HWND_TOP }, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+            | if fullscreen { SWP_HIDEWINDOW } else { SWP_SHOWWINDOW },
+    );
+    if !fullscreen {
+        let _ = InvalidateRect(hwnd, None, false);
     }
 }
 
@@ -1414,11 +1461,12 @@ unsafe fn apply_settings(hwnd_main: HWND, state: &AppState) {
     };
     let rc = appbar_register(hwnd_main, mon_rect, bar_h);
     let _ = SetWindowPos(
-        hwnd_main, HWND_TOP,
+        hwnd_main, None,
         rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
-        SWP_SHOWWINDOW,
+        SWP_NOZORDER | SWP_NOACTIVATE,
     );
-    let _ = InvalidateRect(hwnd_main, None, true);
+    refresh_fullscreen_state(hwnd_main, state, false);
+    let _ = InvalidateRect(hwnd_main, None, false);
 }
 
 unsafe fn open_settings(hwnd_main: HWND, state_ptr: *mut AppState) {
@@ -1682,12 +1730,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         return LRESULT(0);
     }
     match msg {
+        WM_APPBAR => {
+            if !sp.is_null() && wp.0 as u32 == ABN_FULLSCREENAPP {
+                refresh_fullscreen_state(hwnd, &*sp, lp.0 != 0);
+            }
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
-            if !sp.is_null() { on_paint(hwnd, &*sp); }
+            if !sp.is_null() && !(*sp).fullscreen.load(Ordering::Relaxed) {
+                on_paint(hwnd, &*sp);
+            } else if sp.is_null() {
+                let mut ps = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut ps);
+                let brush = CreateSolidBrush(COLORREF(C_BG));
+                FillRect(dc, &ps.rcPaint, brush);
+                let _ = DeleteObject(brush);
+                let _ = EndPaint(hwnd, &ps);
+            } else {
+                let _ = ValidateRect(hwnd, None);
+            }
             LRESULT(0)
         }
         WM_MEDIA_UPDATE => {
-            let _ = InvalidateRect(hwnd, None, false);
+            if !sp.is_null() && !(*sp).fullscreen.load(Ordering::Relaxed) {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
             LRESULT(0)
         }
         updater::MESSAGE => {
@@ -1850,6 +1918,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER => {
             if !sp.is_null() {
+                refresh_fullscreen_state(hwnd, &*sp, false);
+                if (*sp).fullscreen.load(Ordering::Relaxed) { return LRESULT(0); }
                 let info = (*sp).info.lock().unwrap();
                 if info.playing && info.duration_100ns > 0 {
                     let _ = InvalidateRect(hwnd, None, false);
@@ -1887,7 +1957,7 @@ fn main() -> Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as *mut _),
+            hbrBackground: HBRUSH::default(),
             lpszClassName: w!("MediaBarClass"),
             ..Default::default()
         };
@@ -1925,7 +1995,7 @@ fn main() -> Result<()> {
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("MediaBarClass"),
             w!("MediaBar"),
-            WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
+            WS_POPUP | WS_CLIPCHILDREN,
             mon_rect.left, mon_rect.bottom - bar_h,
             mon_rect.right - mon_rect.left, bar_h,
             None, None, hinstance, None,
@@ -1937,7 +2007,7 @@ fn main() -> Result<()> {
         SetWindowPos(
             hwnd, HWND_TOP,
             rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
-            SWP_SHOWWINDOW,
+            SWP_NOACTIVATE,
         )?;
         SetTimer(hwnd, 1, 500, None);
 
@@ -1946,6 +2016,7 @@ fn main() -> Result<()> {
         let font_btn = make_font(w!("Segoe MDL2 Assets"), 14);
 
         let state = Arc::new(AppState {
+            fullscreen:    AtomicBool::new(false),
             info:          Mutex::new(MediaInfo::default()),
             hover:         Mutex::new(Hover::None),
             accent:        AtomicU32::new(get_accent_color()),
@@ -1974,6 +2045,11 @@ fn main() -> Result<()> {
             updater.check(hwnd.0 as isize);
         }
         refresh_update_ui(hwnd, &*STATE_PTR.load(Ordering::Relaxed));
+        let state = &*STATE_PTR.load(Ordering::Relaxed);
+        refresh_fullscreen_state(hwnd, state, false);
+        if !state.fullscreen.load(Ordering::Relaxed) {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
 
         let hwnd_raw = hwnd.0 as isize;
         std::thread::spawn(move || {
@@ -2064,6 +2140,34 @@ fn main() -> Result<()> {
         CoUninitialize();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fullscreen_tests {
+    use super::*;
+
+    #[test]
+    fn fullscreen_and_maximized_work_area_are_distinguished() {
+        let monitor = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        assert!(covers_monitor(monitor, monitor));
+        assert!(!covers_monitor(RECT { bottom: 1000, ..monitor }, monitor));
+        assert!(!covers_monitor(RECT { right: 1919, ..monitor }, monitor));
+    }
+
+    #[test]
+    fn negative_coordinates_and_spanning_windows_are_supported() {
+        let monitor = RECT { left: -1920, top: -200, right: 0, bottom: 880 };
+        assert!(covers_monitor(monitor, monitor));
+        assert!(covers_monitor(RECT { right: 1920, ..monitor }, monitor));
+        assert!(!covers_monitor(RECT { top: -199, ..monitor }, monitor));
+    }
+
+    #[test]
+    fn fullscreen_on_another_monitor_does_not_cover_bar_monitor() {
+        let bar_monitor = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let game_monitor = RECT { left: 1920, top: 0, right: 3840, bottom: 1080 };
+        assert!(!covers_monitor(game_monitor, bar_monitor));
+    }
 }
 
 #[cfg(test)]
